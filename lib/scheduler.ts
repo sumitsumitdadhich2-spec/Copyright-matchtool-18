@@ -55,6 +55,8 @@ import {
   isSuspiciousChunkOutput,
   GeminiError,
   classifyError,
+  extractGoogleRetryDelayMs,
+  calculateEffectiveCooldownMs,
 } from './gemini'
 import { applyGroupMatches, bestRejectedCandidate, groupMatchOrigin, originTag, sameShortSegment } from './candidate-pick'
 import { computeShortCoverage, coverageLine } from './short-coverage'
@@ -1890,22 +1892,25 @@ class Scheduler {
           const pk = this.paceSlotKey(lane, m, slot)
           const st = this.modelState(job, lane, m)
 
+          const googleDelayMs = extractGoogleRetryDelayMs(err) ?? e.retryDelayMs
+          const { effectiveCooldownMs } = calculateEffectiveCooldownMs(googleDelayMs, RATE_COOLDOWN_MS)
+
           if (rateRetries > maxRateRetries) {
-            job.cooldownUntil[rk] = Date.now() + RATE_COOLDOWN_MS
-            job.cooldownUntil[pk] = Date.now() + RATE_COOLDOWN_MS
+            job.cooldownUntil[rk] = Date.now() + effectiveCooldownMs
+            job.cooldownUntil[pk] = Date.now() + effectiveCooldownMs
             if (isVerify) {
-              globalGeminiCoordinator.reportVerifyRateLimit(lane.apiKey, m.id, slot, verifyLockId, RATE_COOLDOWN_MS)
+              globalGeminiCoordinator.reportVerifyRateLimit(lane.apiKey, m.id, slot, verifyLockId, effectiveCooldownMs)
             } else {
-              globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, slot)
+              globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, effectiveCooldownMs, slot)
             }
             st.state = 'cooling'
-            st.cooldownUntil = Date.now() + RATE_COOLDOWN_MS
+            st.cooldownUntil = Date.now() + effectiveCooldownMs
             this.mark(job)
             throw err
           }
 
-          // 1 MINUTE COOLDOWN:
-          const cooldownMs = RATE_COOLDOWN_MS // 60,000 ms (1 minute)
+          // DYNAMIC COOLDOWN (Google requested delay + 5s buffer):
+          const cooldownMs = effectiveCooldownMs
           const coolUntil = Date.now() + cooldownMs
 
           job.cooldownUntil[rk] = coolUntil
@@ -1920,10 +1925,11 @@ class Scheduler {
           st.cooldownUntil = coolUntil
           this.mark(job)
 
+          const googleNote = googleDelayMs ? ` (Google requested ${(googleDelayMs / 1000).toFixed(1)}s + 5s safety buffer)` : ''
           addLog(
             job.scan,
             'warn',
-            `Verifier: 429 rate limit on ${displayModelName(m.id)} (key ${lane.idx}) — giving 1 min cooldown. Priority Lock held; will send first when 1 min completes (attempt ${rateRetries}/${maxRateRetries}).`,
+            `Verifier: 429 rate limit on ${displayModelName(m.id)} (key ${lane.idx})${googleNote} — giving ${(cooldownMs / 1000).toFixed(1)}s lock. Priority Lock held; will send first when lock expires (attempt ${rateRetries}/${maxRateRetries}).`,
           )
 
           const waitMs = coolUntil - Date.now()
@@ -1943,7 +1949,7 @@ class Scheduler {
           addLog(
             job.scan,
             'info',
-            `Verifier: 1 min cooldown ended for ${displayModelName(m.id)} (key ${lane.idx}) — sending priority retry now!`,
+            `Verifier: ${(cooldownMs / 1000).toFixed(1)}s lock ended for ${displayModelName(m.id)} (key ${lane.idx}) — sending priority retry now!`,
           )
           continue
         }
@@ -2249,13 +2255,17 @@ class Scheduler {
             } catch (reqErr) {
               const re = classifyError(reqErr)
               if (re.kind === 'rate') {
-                // 429 Rate limit on this (key × model): Cool this model for 60s and switch immediately to another free lane!
-                release(0, 60_000)
-                globalGeminiCoordinator.handleQuotaOrRateError(chosenLane.apiKey, chosenRm.id, 0, chosenRm.rpd || 500, false)
+                const googleDelayMs = extractGoogleRetryDelayMs(reqErr) ?? re.retryDelayMs
+                const { effectiveCooldownMs } = calculateEffectiveCooldownMs(googleDelayMs, 60_000)
+
+                // 429 Rate limit on this (key × model): Lock this model for Google delay + 5s buffer and switch immediately to another free lane!
+                release(0, effectiveCooldownMs)
+                globalGeminiCoordinator.handleQuotaOrRateError(chosenLane.apiKey, chosenRm.id, 0, chosenRm.rpd || 500, false, effectiveCooldownMs)
+                const googleNote = googleDelayMs ? ` (Google requested ${(googleDelayMs / 1000).toFixed(1)}s + 5s buffer)` : ''
                 addLog(
                   scan,
                   'warn',
-                  `Rescan: 429 rate limit on ${chosenRm.id} (key ${chosenLane.idx}) — model cooling for 60s. Switching immediately to another free key/model (attempt ${tryIdx + 1}/${MAX_RESCAN_TRIES})...`,
+                  `Rescan: 429 rate limit on ${chosenRm.id} (key ${chosenLane.idx})${googleNote} — model locked for ${(effectiveCooldownMs / 1000).toFixed(1)}s. Switching immediately to another free key/model (attempt ${tryIdx + 1}/${MAX_RESCAN_TRIES})...`,
                 )
                 continue
               } else {
@@ -2919,8 +2929,11 @@ class Scheduler {
                 throw reqErr
               }
 
-              // 1 MINUTE COOLDOWN WITH EXCLUSIVE PRIORITY RETRY LOCK
-              const cooldownMs = 60_000
+              const googleDelayMs = extractGoogleRetryDelayMs(reqErr) ?? re.retryDelayMs
+              const { effectiveCooldownMs } = calculateEffectiveCooldownMs(googleDelayMs, 60_000)
+
+              // DYNAMIC COOLDOWN WITH EXCLUSIVE PRIORITY RETRY LOCK (Google requested delay + 5s buffer)
+              const cooldownMs = effectiveCooldownMs
               const coolUntil = Date.now() + cooldownMs
               job.cooldownUntil[rk] = coolUntil
               globalGeminiCoordinator.reportChunkRateLimit(lane.apiKey, m.id, chunkLockId, cooldownMs)
@@ -2929,10 +2942,11 @@ class Scheduler {
               st.cooldownUntil = coolUntil
               this.mark(job)
 
+              const googleNote = googleDelayMs ? ` (Google requested ${(googleDelayMs / 1000).toFixed(1)}s + 5s safety buffer)` : ''
               addLog(
                 scan,
                 'warn',
-                `${minutePrefix}Chunk ${chunkIndex}: 429 rate limit on ${displayModelName(m.id)} (key ${lane.idx}) — giving 1 min cooldown. Priority Lock held; will send first when 1 min completes (attempt ${rateRetries}/${maxRateRetries}).`,
+                `${minutePrefix}Chunk ${chunkIndex}: 429 rate limit on ${displayModelName(m.id)} (key ${lane.idx})${googleNote} — giving ${(cooldownMs / 1000).toFixed(1)}s lock. Priority Lock held; will send first when lock expires (attempt ${rateRetries}/${maxRateRetries}).`,
               )
 
               const waitMs = coolUntil - Date.now()
@@ -2954,7 +2968,7 @@ class Scheduler {
               addLog(
                 scan,
                 'info',
-                `${minutePrefix}Chunk ${chunkIndex}: 1 min cooldown ended for ${displayModelName(m.id)} (key ${lane.idx}) — sending priority retry now!`,
+                `${minutePrefix}Chunk ${chunkIndex}: ${(cooldownMs / 1000).toFixed(1)}s lock ended for ${displayModelName(m.id)} (key ${lane.idx}) — sending priority retry now!`,
               )
               continue
             } else {

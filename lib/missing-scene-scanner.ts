@@ -7,6 +7,8 @@ import {
   uploadVideo,
   deleteFileQuiet,
   classifyError,
+  extractGoogleRetryDelayMs,
+  calculateEffectiveCooldownMs,
   CHUNK_MAP_SANITIZED_PROMPT,
   type UploadProgress,
 } from './gemini'
@@ -543,17 +545,22 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
           } catch (reqErr) {
             const re = classifyError(reqErr)
             if (re.kind === 'rate' || re.kind === 'rpd') {
+              const googleDelayMs = extractGoogleRetryDelayMs(reqErr) ?? re.retryDelayMs
+              const { effectiveCooldownMs } = calculateEffectiveCooldownMs(googleDelayMs, 60_000)
+
               const outcome = globalGeminiCoordinator.handleQuotaOrRateError(
                 selected.apiKey,
                 selected.modelId,
                 0,
                 selected.rpd || 20,
                 re.kind === 'rpd',
+                effectiveCooldownMs,
               )
+              const googleNote = googleDelayMs ? ` (Google requested ${(googleDelayMs / 1000).toFixed(1)}s + 5s buffer)` : ''
               addLog(
                 scan,
                 'warn',
-                `[Missing Scene Finder] Chunk ${chunkIdx + 1}: ${outcome.reason} (attempt ${chunkAttempt}/${maxChunkAttempts})`,
+                `[Missing Scene Finder] Chunk ${chunkIdx + 1}${googleNote}: ${outcome.reason} (attempt ${chunkAttempt}/${maxChunkAttempts})`,
               )
               continue
             }

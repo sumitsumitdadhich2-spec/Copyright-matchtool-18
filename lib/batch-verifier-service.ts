@@ -3,7 +3,15 @@ import { GoogleGenAI } from '@google/genai'
 import { getScan, saveScan, addLog, getAllApiKeys, incrementModelUsage } from './store'
 import { getAllUserApiKeys } from './user-keys'
 import { globalGeminiCoordinator, type CandidateLane } from './global-gemini-coordinator'
-import { uploadVideo, deleteFileQuiet, extractResponseText, classifyError, getClient } from './gemini'
+import {
+  uploadVideo,
+  deleteFileQuiet,
+  extractResponseText,
+  classifyError,
+  getClient,
+  extractGoogleRetryDelayMs,
+  calculateEffectiveCooldownMs,
+} from './gemini'
 import { planMinuteSegments, stitchMinuteVerificationClips } from './batch-minute-stitcher'
 import { buildBatchVerifierPrompt, fmtMs } from './batch-verifier-prompt'
 import { CancelToken } from './ffmpeg-pool'
@@ -307,17 +315,23 @@ export async function verifySingleMinute(
         )
 
         if ((geminiErr.kind === 'rpd' || geminiErr.kind === 'rate') && chosenLane) {
+          const googleDelayMs = extractGoogleRetryDelayMs(err) ?? geminiErr.retryDelayMs
+          const { effectiveCooldownMs } = calculateEffectiveCooldownMs(googleDelayMs, 60_000)
+
           const outcome = globalGeminiCoordinator.handleQuotaOrRateError(
             chosenLane.apiKey,
             chosenLane.modelId,
             0,
             chosenLane.rpd || 20,
             geminiErr.kind === 'rpd',
+            effectiveCooldownMs,
           )
+
+          const googleNote = googleDelayMs ? ` (Google requested ${(googleDelayMs / 1000).toFixed(1)}s + 5s buffer = ${(effectiveCooldownMs / 1000).toFixed(1)}s lock)` : ''
           logScan(
             scanId,
             'warn',
-            `[Batch Verifier] Key ${chosenLane.keyIdx} (${chosenModel}): ${outcome.reason}`,
+            `[Batch Verifier] Key ${chosenLane.keyIdx} (${chosenModel})${googleNote}: ${outcome.reason}`,
           )
           continue
         }

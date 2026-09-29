@@ -21,11 +21,132 @@ const GEN_CONFIG = {
 
 export type GeminiErrorKind = 'rpd' | 'rate' | 'unavailable' | 'invalid_key' | 'empty' | 'policy_blocked' | 'other'
 
+/** Extra safety buffer added on top of Google Gemini's requested retryDelay (in ms) */
+export const GOOGLE_RETRY_SAFETY_BUFFER_MS = 5_000
+
 export class GeminiError extends Error {
   kind: GeminiErrorKind
-  constructor(kind: GeminiErrorKind, message: string) {
+  retryDelayMs?: number
+
+  constructor(kind: GeminiErrorKind, message: string, retryDelayMs?: number) {
     super(message)
     this.kind = kind
+    this.retryDelayMs = retryDelayMs
+  }
+}
+
+/**
+ * Extracts Google Gemini API's exact retry delay in milliseconds from:
+ * 1. RPC RetryInfo details array: e.g. { "@type": "...RetryInfo", "retryDelay": "54s" } or "16.371246104s"
+ * 2. Error message string: "Please retry in 54.584221572s." or "retry after 16s"
+ * 3. Raw JSON response errors
+ */
+export function extractGoogleRetryDelayMs(err: unknown): number | null {
+  if (!err) return null
+
+  // 1. Direct attached retryDelayMs
+  if (typeof (err as { retryDelayMs?: number }).retryDelayMs === 'number') {
+    const d = (err as { retryDelayMs: number }).retryDelayMs
+    if (d > 0) return d
+  }
+
+  const parseSecondsVal = (val: unknown): number | null => {
+    if (typeof val === 'number' && Number.isFinite(val) && val > 0) {
+      return Math.ceil(val * 1000)
+    }
+    if (typeof val === 'string') {
+      const match = val.trim().match(/^([\d.]+)\s*s?$/i)
+      if (match) {
+        const sec = parseFloat(match[1])
+        if (Number.isFinite(sec) && sec > 0) return Math.ceil(sec * 1000)
+      }
+    }
+    return null
+  }
+
+  // 2. Structured object details inspection
+  const inspectObject = (obj: unknown): number | null => {
+    if (!obj || typeof obj !== 'object') return null
+    const o = obj as Record<string, unknown>
+
+    const details = Array.isArray(o.details)
+      ? o.details
+      : Array.isArray((o.error as Record<string, unknown>)?.details)
+        ? ((o.error as Record<string, unknown>).details as unknown[])
+        : null
+
+    if (Array.isArray(details)) {
+      for (const d of details) {
+        if (d && typeof d === 'object') {
+          const item = d as Record<string, unknown>
+          if (item.retryDelay !== undefined) {
+            const ms = parseSecondsVal(item.retryDelay)
+            if (ms) return ms
+          }
+        }
+      }
+    }
+
+    if (o.retryDelay !== undefined) {
+      const ms = parseSecondsVal(o.retryDelay)
+      if (ms) return ms
+    }
+    return null
+  }
+
+  const direct = inspectObject(err)
+  if (direct) return direct
+
+  // 3. String & message inspection
+  const fullMsg = err instanceof Error ? err.message : String(err)
+
+  // Embedded JSON parser
+  try {
+    const jsonMatch = fullMsg.match(/\{[\s\S]*"error"[\s\S]*\}/) || fullMsg.match(/\{[\s\S]*"retryDelay"[\s\S]*\}/)
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0])
+      const ms = inspectObject(parsed)
+      if (ms) return ms
+    }
+  } catch {
+    // ignore json parse fail
+  }
+
+  // Regex for "Please retry in 54.584221572s" or "retry after 16s" or "retryDelay": "54s"
+  const regexPatterns = [
+    /Please retry in\s+([\d.]+)\s*s?/i,
+    /retry\s+in\s+([\d.]+)\s*s?/i,
+    /retry\s+after\s+([\d.]+)\s*s?/i,
+    /retryDelay["']?\s*:\s*["']?([\d.]+)\s*s?/i,
+    /retry_delay["']?\s*:\s*["']?([\d.]+)\s*s?/i,
+  ]
+
+  for (const re of regexPatterns) {
+    const m = fullMsg.match(re)
+    if (m && m[1]) {
+      const sec = parseFloat(m[1])
+      if (Number.isFinite(sec) && sec > 0) {
+        return Math.ceil(sec * 1000)
+      }
+    }
+  }
+
+  return null
+}
+
+/**
+ * Calculates effective cooldown duration: Google's exact retry delay + user requested 5-second buffer.
+ */
+export function calculateEffectiveCooldownMs(googleDelayMs: number | null | undefined, fallbackMs: number = 60_000): {
+  googleDelayMs: number | null
+  effectiveCooldownMs: number
+  bufferMs: number
+} {
+  const baseMs = typeof googleDelayMs === 'number' && googleDelayMs > 0 ? googleDelayMs : fallbackMs
+  return {
+    googleDelayMs: typeof googleDelayMs === 'number' && googleDelayMs > 0 ? googleDelayMs : null,
+    effectiveCooldownMs: baseMs + GOOGLE_RETRY_SAFETY_BUFFER_MS,
+    bufferMs: GOOGLE_RETRY_SAFETY_BUFFER_MS,
   }
 }
 
@@ -515,6 +636,7 @@ export function classifyError(err: unknown): GeminiError {
       msg = `${msg} (${causeMsg})`
     }
   }
+  const googleRetryDelayMs = extractGoogleRetryDelayMs(err)
   const lower = msg.toLowerCase()
   // Invalid or expired API Key — must disable the lane immediately and not count attempts against the item.
   if (
@@ -543,7 +665,7 @@ export function classifyError(err: unknown): GeminiError {
     lower.includes('overloaded') ||
     lower.includes('fetch failed')
   ) {
-    return new GeminiError('rate', msg)
+    return new GeminiError('rate', msg, googleRetryDelayMs ?? undefined)
   }
 
   // 1. Check if it's explicitly a TEMPORARY minute rate limit (TPM or RPM).
@@ -616,14 +738,14 @@ export function classifyError(err: unknown): GeminiError {
     lower.includes('tpm')
 
   if (is429) {
-    return new GeminiError('rate', msg)
+    return new GeminiError('rate', msg, googleRetryDelayMs ?? undefined)
   }
 
   if (lower.includes('empty') && (lower.includes('response') || lower.includes('finder') || lower.includes('model'))) {
     return new GeminiError('empty', msg)
   }
 
-  return new GeminiError('other', msg)
+  return new GeminiError('other', msg, googleRetryDelayMs ?? undefined)
 }
 
 /** The ONE prompt sent for EVERY movie chunk (word-for-word from data/experiment-prompt.md). */

@@ -699,21 +699,26 @@ class GlobalGeminiCoordinator {
     const kh = apiKeyHash(apiKey)
     const now = Date.now()
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
-    lane.cooldownUntil = Math.max(lane.cooldownUntil, now + cooldownMs)
+    const coolUntil = now + cooldownMs
+    lane.cooldownUntil = Math.max(lane.cooldownUntil, coolUntil)
 
     // Cooldown only slots for THIS specific model on this API key.
     // Each model has its own independent 250k TPM and 15 RPM quota!
     for (const other of this.lanes.values()) {
       if (other.keyHash === kh && other.modelId === modelId) {
-        other.cooldownUntil = Math.max(other.cooldownUntil, now + cooldownMs)
+        other.cooldownUntil = Math.max(other.cooldownUntil, coolUntil)
       }
     }
+
+    console.log(
+      `[Global Coordinator] 429 Lock on ${modelId} (Key ${lane.keyIdx}, Hash: ${kh.slice(0, 6)}): Locked for ${(cooldownMs / 1000).toFixed(1)}s (until ${new Date(coolUntil).toLocaleTimeString()}). All other requests blocked on this model.`,
+    )
   }
 
   /**
    * Report 429 rate limit on a VERIFIER request.
    * 1. Sets an exclusive retry lock for this request/slot on (key × model).
-   * 2. Sets a 1-minute cooldown across all slots of this model.
+   * 2. Sets a dynamic cooldown across all slots of this model (Google delay + safety buffer).
    * 3. Guarantees that when cooldown expires, ONLY this request is allowed to retry first!
    */
   public reportVerifyRateLimit(
@@ -739,7 +744,7 @@ class GlobalGeminiCoordinator {
     }
 
     console.log(
-      `[Global Coordinator] Verifier 429 on ${modelId} (Key hash: ${kh.slice(0, 6)}, Slot ${slot}). Exclusive priority retry lock held for "${vmState.retryLockId}". ${Math.ceil(cooldownMs / 1000)}s cooldown applied.`,
+      `[Global Coordinator] [429 VERIFIER LOCK] ${modelId} (Key hash: ${kh.slice(0, 6)}, Slot ${slot}): Exclusive priority retry lock held for "${vmState.retryLockId}". ${(cooldownMs / 1000).toFixed(1)}s lock applied (until ${new Date(coolUntil).toLocaleTimeString()}).`,
     )
   }
 
@@ -826,7 +831,7 @@ class GlobalGeminiCoordinator {
   /**
    * Report 429 rate limit on a CHUNK mapping request.
    * 1. Sets an exclusive retry lock for this specific chunk on (key × model).
-   * 2. Sets a 1-minute (60s) cooldown across this model.
+   * 2. Sets a dynamic cooldown across this model (Google delay + safety buffer).
    * 3. Guarantees that when cooldown expires, ONLY this request is allowed to retry first!
    */
   public reportChunkRateLimit(
@@ -850,7 +855,7 @@ class GlobalGeminiCoordinator {
     }
 
     console.log(
-      `[Global Coordinator] Chunk 429 on ${modelId} (Key hash: ${kh.slice(0, 6)}). Exclusive priority retry lock held for "${cmState.retryLockId}". ${Math.ceil(cooldownMs / 1000)}s cooldown applied.`,
+      `[Global Coordinator] [429 CHUNK LOCK] ${modelId} (Key hash: ${kh.slice(0, 6)}): Exclusive priority retry lock held for "${cmState.retryLockId}". ${(cooldownMs / 1000).toFixed(1)}s lock applied (until ${new Date(coolUntil).toLocaleTimeString()}).`,
     )
   }
 
@@ -916,7 +921,7 @@ class GlobalGeminiCoordinator {
    * Smart Quota/Rate Limit handler according to user rules:
    * 1. Never disable the entire API key! Only isolate this specific model on this key.
    * 2. Do not immediately believe a first "quota error" / 429 as permanent daily quota exhaustion.
-   * 3. Apply a 1m 10s cooldown (70s) on that model and allow a retry.
+   * 3. Apply exact Google delay + 5s buffer lock on that model and allow a retry.
    * 4. Only if it fails AGAIN after cooldown (consecutive >= 2) OR if actual usedToday >= rpdCap,
    *    mark this model as daily exhausted for today.
    */
@@ -926,6 +931,7 @@ class GlobalGeminiCoordinator {
     slot: number = 0,
     rpdCap: number = 20,
     isExplicitDailyMsg: boolean = false,
+    cooldownMsOverride?: number,
   ): {
     action: 'cooldown' | 'exhausted'
     waitSec: number
@@ -934,6 +940,9 @@ class GlobalGeminiCoordinator {
     this.checkDayRollover()
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
     const used = getModelUsage(modelId, apiKey)
+    const effectiveCooldownMs = cooldownMsOverride !== undefined && cooldownMsOverride > 0
+      ? cooldownMsOverride
+      : CHUNK_COOLDOWN_MS
 
     // If actual recorded usage has reached or exceeded the daily cap, it is definitively exhausted
     if (used >= rpdCap) {
@@ -948,13 +957,14 @@ class GlobalGeminiCoordinator {
     lane.consecutiveQuotaErrors = (lane.consecutiveQuotaErrors || 0) + 1
 
     // If it's the 1st quota error, or usage is well below cap (< rpdCap):
-    // Put ONLY this model in 70s cooldown (1 min 10 sec) and give it a chance to retry!
+    // Put ONLY this model in cooldown (Google delay + 5s buffer) and give it a chance to retry!
     if (lane.consecutiveQuotaErrors < 2 && !isExplicitDailyMsg) {
-      this.reportRateLimit(apiKey, modelId, CHUNK_COOLDOWN_MS, slot)
+      this.reportRateLimit(apiKey, modelId, effectiveCooldownMs, slot)
+      const waitSec = Math.ceil(effectiveCooldownMs / 1000)
       return {
         action: 'cooldown',
-        waitSec: Math.ceil(CHUNK_COOLDOWN_MS / 1000),
-        reason: `Rate/quota spike on ${modelId} (Key ${lane.keyIdx}, used ${used}/${rpdCap} RPD) — cooling down for 1m 10s before retry`,
+        waitSec,
+        reason: `Rate/quota spike on ${modelId} (Key ${lane.keyIdx}, used ${used}/${rpdCap} RPD) — locked for ${waitSec}s (+5s buffer) before retry`,
       }
     }
 
@@ -968,12 +978,13 @@ class GlobalGeminiCoordinator {
       }
     }
 
-    // Fallback: temporary 70s cooldown
-    this.reportRateLimit(apiKey, modelId, CHUNK_COOLDOWN_MS, slot)
+    // Fallback: temporary cooldown
+    this.reportRateLimit(apiKey, modelId, effectiveCooldownMs, slot)
+    const fallbackWaitSec = Math.ceil(effectiveCooldownMs / 1000)
     return {
       action: 'cooldown',
-      waitSec: Math.ceil(CHUNK_COOLDOWN_MS / 1000),
-      reason: `Temporary rate limit on ${modelId} (Key ${lane.keyIdx}) — cooling down for 1m 10s before retry`,
+      waitSec: fallbackWaitSec,
+      reason: `Temporary rate limit on ${modelId} (Key ${lane.keyIdx}) — locked for ${fallbackWaitSec}s before retry`,
     }
   }
 
