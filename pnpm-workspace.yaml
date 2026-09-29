@@ -24,6 +24,8 @@ allowBuilds:
   # Needed for the standalone build's symlink-tracing fix to work correctly.
   '@google/genai': true
   # Prints a "thank you" banner only.
+  core-js: false
+  core-js-pure: false
   msw: false
   # Version-consistency check for its own sub-packages; not needed at runtime.
   protobufjs: false
