@@ -19,10 +19,11 @@ import {
   Loader2,
 } from 'lucide-react'
 import type { Scan, LogEntry } from '@/lib/types'
+import type { RawGeminiErrorRecord } from '@/lib/gemini'
 import { EngineBadge } from './engine-badge'
 import { downloadScanLogsPdf } from '@/lib/pdf-export'
 
-type LogCategory = 'all' | 'batch' | 'render' | 'rescan' | 'scan' | 'alerts'
+type LogCategory = 'all' | 'batch' | 'render' | 'rescan' | 'scan' | 'alerts' | 'errors'
 
 interface CategoryDef {
   id: LogCategory
@@ -108,6 +109,12 @@ const CATEGORIES: CategoryDef[] = [
       )
     },
   },
+  {
+    id: 'errors',
+    label: 'Raw 429/503 (Last 50)',
+    icon: Terminal,
+    countMatcher: () => false,
+  },
 ]
 
 function getLogCategoryTag(msg: string | undefined, level: string | undefined) {
@@ -170,6 +177,38 @@ export function LogsPanel({ scan }: { scan: Scan }) {
     }
   }, [logs.length, autoScroll])
 
+  const [rawErrors, setRawErrors] = useState<RawGeminiErrorRecord[]>([])
+  const [loadingErrors, setLoadingErrors] = useState(false)
+
+  // Fetch recent raw 429/503 errors
+  useEffect(() => {
+    let active = true
+    const fetchErrors = async () => {
+      try {
+        setLoadingErrors(true)
+        const res = await fetch('/api/gemini-errors')
+        if (!res.ok) return
+        const data = await res.json()
+        if (active && Array.isArray(data.errors)) {
+          setRawErrors(data.errors)
+        }
+      } catch {
+        // ignore
+      } finally {
+        if (active) setLoadingErrors(false)
+      }
+    }
+
+    if (category === 'errors') {
+      void fetchErrors()
+      const timer = setInterval(fetchErrors, 5000)
+      return () => {
+        active = false
+        clearInterval(timer)
+      }
+    }
+  }, [category])
+
   // Compute category counts
   const categoryCounts = useMemo(() => {
     const counts: Record<LogCategory, number> = {
@@ -179,17 +218,18 @@ export function LogsPanel({ scan }: { scan: Scan }) {
       rescan: 0,
       scan: 0,
       alerts: 0,
+      errors: rawErrors.length,
     }
     for (const l of logs) {
       if (!l) continue
       for (const cat of CATEGORIES) {
-        if (cat.id !== 'all' && cat.countMatcher(l)) {
+        if (cat.id !== 'all' && cat.id !== 'errors' && cat.countMatcher(l)) {
           counts[cat.id]++
         }
       }
     }
     return counts
-  }, [logs])
+  }, [logs, rawErrors.length])
 
   // Filter logs by active category and search
   const filteredLogs = useMemo(() => {
@@ -256,13 +296,30 @@ export function LogsPanel({ scan }: { scan: Scan }) {
 
   const [downloadingPdf, setDownloadingPdf] = useState(false)
 
+  const filteredRawErrors = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    if (!q) return rawErrors
+    return rawErrors.filter(
+      (e) =>
+        e.model.toLowerCase().includes(q) ||
+        e.requestKind.toLowerCase().includes(q) ||
+        (e.quotaId && e.quotaId.toLowerCase().includes(q)) ||
+        e.rawSnippet.toLowerCase().includes(q),
+    )
+  }, [rawErrors, search])
+
   const handleCopyLogs = async () => {
-    const text = filteredLogs
-      .map(
-        (l) =>
-          `[${new Date(l.t).toLocaleTimeString([], { hour12: false })}] [${l.level.toUpperCase()}] ${l.msg}`,
-      )
-      .join('\n')
+    let text = ''
+    if (category === 'errors') {
+      text = filteredRawErrors.map((e) => JSON.stringify(e)).join('\n')
+    } else {
+      text = filteredLogs
+        .map(
+          (l) =>
+            `[${new Date(l.t).toLocaleTimeString([], { hour12: false })}] [${l.level.toUpperCase()}] ${l.msg}`,
+        )
+        .join('\n')
+    }
     await navigator.clipboard.writeText(text).catch(() => {})
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
@@ -464,7 +521,53 @@ export function LogsPanel({ scan }: { scan: Scan }) {
         role="log"
         aria-live="polite"
       >
-        {filteredLogs.length === 0 ? (
+        {category === 'errors' ? (
+          filteredRawErrors.length === 0 ? (
+            <div className="flex h-full flex-col items-center justify-center p-6 text-center text-muted-foreground">
+              <Filter className="size-7 stroke-[1.5] text-muted-foreground/40 mb-2" />
+              <p className="text-xs font-medium text-foreground/80">
+                {loadingErrors ? 'Loading raw Gemini errors...' : search ? 'Koi error match nahi hua' : 'No 429/503 errors recorded yet'}
+              </p>
+              <p className="text-[11px] text-muted-foreground/60 mt-1">
+                429 (rate/RPD) and 503 (overload) errors are automatically recorded here (last 50).
+              </p>
+            </div>
+          ) : (
+            filteredRawErrors.map((err, i) => (
+              <div key={i} className="py-2 px-1 hover:bg-secondary/40 rounded transition-colors text-xs">
+                <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                  <span className="text-muted-foreground/60 font-mono">
+                    {new Date(err.time).toLocaleTimeString([], { hour12: false })}
+                  </span>
+                  <span
+                    className={`inline-block rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                      err.httpStatus === 503
+                        ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                        : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                    }`}
+                  >
+                    HTTP {err.httpStatus || 429}
+                  </span>
+                  <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] font-medium text-foreground">
+                    Key {err.keyIdx || 0}
+                  </span>
+                  <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] font-medium text-foreground">
+                    {err.model}
+                  </span>
+                  <span className="text-muted-foreground text-[10px]">[{err.requestKind}]</span>
+                  {err.quotaId && (
+                    <span className="text-[10px] text-amber-400/90 font-mono">
+                      quota: {err.quotaId} {err.quotaValue ? `(${err.quotaValue})` : ''}
+                    </span>
+                  )}
+                </div>
+                <pre className="mt-1 whitespace-pre-wrap font-mono text-[10px] text-muted-foreground bg-muted/40 p-1.5 rounded max-h-24 overflow-y-auto">
+                  {err.rawSnippet}
+                </pre>
+              </div>
+            ))
+          )
+        ) : filteredLogs.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center p-6 text-center text-muted-foreground">
             <Filter className="size-7 stroke-[1.5] text-muted-foreground/40 mb-2" />
             <p className="text-xs font-medium text-foreground/80">

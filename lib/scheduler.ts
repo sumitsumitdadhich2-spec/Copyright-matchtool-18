@@ -46,6 +46,7 @@ import {
   deleteFileQuiet,
   cleanupOrphanedGeminiFiles,
   mapChunkRequest,
+  CHUNK_MAP_PROMPT,
   CHUNK_MAP_SANITIZED_PROMPT,
   parseChunkMatches,
   verifyRequest,
@@ -120,6 +121,7 @@ interface Job {
   chunkPhaseDone: boolean
   /** set when a rejected group revived early-stop-skipped chunks — triggers an extra scan pass */
   earlyStopRevived: boolean
+  laneFirstSuccess: Set<number>
   stopping: boolean
   /** pacing state keyed by `${laneIdx}|${modelId}`: earliest time the next request may be sent.
    *  Set after every request from its actual token size so every model runs at full TPM capacity. */
@@ -152,6 +154,7 @@ function chunkAbsWindow(scan: Scan, chunkIndex: number): { start: number; end: n
 class Scheduler {
   jobs = new Map<string, Job>()
   private dailyResetTimer: ReturnType<typeof setInterval> | null = null
+  private modelTokenRateEMA = new Map<string, number>()
 
   constructor() {
     // Periodically check if a new day has arrived (at midnight Pacific Time / new date)
@@ -380,6 +383,7 @@ class Scheduler {
       rescanQueue: [],
       chunkPhaseDone: false,
       earlyStopRevived: false,
+      laneFirstSuccess: new Set(),
       stopping: false,
       nextFreeAt: {},
       cooldownUntil: {},
@@ -1178,13 +1182,37 @@ class Scheduler {
         // background so the next pass starts instantly.
         this.prepareNextSegment(job, segments, seg.index)
 
-        // CHUNK PIPELINE: one worker per (key lane × CHUNK model) — these
-        // workers ONLY do chunk mapping, never verification.
-        const chunkWorkers: Promise<void>[] = []
-        for (const lane of job.lanes) {
-          for (const m of CHUNK_MODEL_POOL) chunkWorkers.push(this.worker(job, lane, m))
-        }
-        await Promise.all(chunkWorkers)
+        // CHUNK PIPELINE: Staggered model start per lane.
+        // For each lane, start ONLY the first model (pick primary rotated by keyIdx % modelCount),
+        // wait for that lane's first chunk to succeed, and only then launch the remaining models for that lane.
+        job.laneFirstSuccess.clear()
+        const lanePromises = job.lanes.map(async (lane) => {
+          const modelCount = CHUNK_MODEL_POOL.length
+          if (modelCount === 0) return
+          const primaryIdx = lane.idx % modelCount
+          const primaryModel = CHUNK_MODEL_POOL[primaryIdx]
+          const secondaryModels = CHUNK_MODEL_POOL.filter((_, idx) => idx !== primaryIdx)
+
+          const primaryWorkerPromise = this.worker(job, lane, primaryModel)
+          const laneWorkers: Promise<void>[] = [primaryWorkerPromise]
+
+          if (secondaryModels.length > 0) {
+            const launchRemaining = async () => {
+              while (!job.stopping && !job.laneFirstSuccess.has(lane.idx)) {
+                if (job.queue.length === 0 && job.inFlight.size === 0) break
+                await sleep(500)
+              }
+              if (!job.stopping && job.laneFirstSuccess.has(lane.idx)) {
+                const secondaries = secondaryModels.map((m) => this.worker(job, lane, m))
+                await Promise.all(secondaries)
+              }
+            }
+            laneWorkers.push(launchRemaining())
+          }
+
+          await Promise.all(laneWorkers)
+        })
+        await Promise.all(lanePromises)
         // Catch any candidates merged by the very last chunk.
         this.enqueueNewGroups(job)
 
@@ -2368,7 +2396,15 @@ class Scheduler {
             const re = classifyError(vErr)
             if (re.kind === 'rate') {
               releaseV(0, 60_000)
-              globalGeminiCoordinator.handleQuotaOrRateError(chosenLaneV.apiKey, chosenRvm.id, 0, chosenRvm.rpd || 500, false)
+              globalGeminiCoordinator.handleQuotaOrRateError(
+                chosenLaneV.apiKey,
+                chosenRvm.id,
+                0,
+                chosenRvm.rpd || 500,
+                false,
+                60_000,
+                chosenLaneV.idx,
+              )
               addLog(
                 scan,
                 'warn',
@@ -2816,8 +2852,27 @@ class Scheduler {
           }
         }
 
+        // Request-size guard: before calling mapChunkRequest, log estimated input tokens
+        const segDuration = seg.end - seg.start
+        const movieChunkDuration = 60
+        const totalVideoDurationSec = segDuration + movieChunkDuration
+        const promptChars = (effectivePrompt || CHUNK_MAP_PROMPT).length
+        const currentEmaRate = this.modelTokenRateEMA.get(m.id) ?? 260
+        const estimatedTokens = Math.round(totalVideoDurationSec * currentEmaRate + promptChars / 4)
+
+        if (estimatedTokens > 200_000) {
+          addLog(
+            scan,
+            'warn',
+            `${minutePrefix}Chunk ${chunkIndex}: Large input size warning! Estimated ${estimatedTokens.toLocaleString()} tokens > 200,000 limit (${totalVideoDurationSec.toFixed(1)}s video) on ${m.id}`,
+          )
+        }
+
         let rateRetries = 0
         const maxRateRetries = 2
+        let overloadedRetries = 0
+        const maxOverloadedRetries = 3
+        const overloadedDelays = [5_000, 15_000, 45_000]
 
         while (true) {
           if (job.stopping) {
@@ -2829,10 +2884,22 @@ class Scheduler {
 
           try {
             // Request Attempt: Call Gemini
-            raw = await mapChunkRequest(lane.ai, m.id, effectiveShortUri, effectiveUploadedUri, effectivePrompt)
+            const mapRes = await mapChunkRequest(lane.ai, m.id, effectiveShortUri, effectiveUploadedUri, effectivePrompt)
+            raw = mapRes.text
+
+            if (mapRes.promptTokenCount && totalVideoDurationSec > 0) {
+              const actualPromptTokens = mapRes.promptTokenCount
+              const videoTokens = Math.max(0, actualPromptTokens - promptChars / 4)
+              const actualRate = videoTokens / totalVideoDurationSec
+              const prevEMA = this.modelTokenRateEMA.get(m.id) ?? 260
+              const alpha = 0.2
+              this.modelTokenRateEMA.set(m.id, alpha * actualRate + (1 - alpha) * prevEMA)
+            }
+
             const used = incrementModelUsage(m.id, lane.apiKey)
             st.usedToday = used
             chunk.requestCount = (chunk.requestCount || 0) + 1
+            job.laneFirstSuccess.add(lane.idx)
 
             // 1 successful chunk mapping request -> Mandatory 1-minute (60s) cooldown
             // and clear 429 priority lock if it was held!
@@ -2857,7 +2924,7 @@ class Scheduler {
             this.mark(job)
             break
           } catch (reqErr) {
-            const re = classifyError(reqErr)
+            const re = classifyError(reqErr, { keyIdx: lane.idx, model: m.id, requestKind: 'chunk_map' })
             const isPolicyBlocked =
               re.kind === 'policy_blocked' ||
               /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(re.message)
@@ -2865,7 +2932,31 @@ class Scheduler {
             chunk.requestCount = (chunk.requestCount || 0) + 1
             this.mark(job)
 
-            if (isPolicyBlocked && !chunk.policyRetried) {
+            if (re.kind === 'overloaded') {
+              overloadedRetries++
+              if (overloadedRetries <= maxOverloadedRetries) {
+                const baseDelay = overloadedDelays[overloadedRetries - 1]
+                const jitterMs = Math.round(Math.random() * 2000)
+                const waitMs = baseDelay + jitterMs
+
+                // Log exactly "503 overloaded" (not "quota error") per model so identical lines aggregate into "(x10)"
+                addLog(scan, 'warn', `${m.id} (key ${lane.idx}): 503 overloaded`)
+                this.mark(job)
+
+                await this.stoppableSleep(job, waitMs)
+                if (job.stopping) {
+                  globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
+                  chunk.status = 'pending'
+                  this.mark(job)
+                  return
+                }
+                continue
+              }
+
+              // Only switch key/model on the 4th failure
+              globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
+              throw reqErr
+            } else if (isPolicyBlocked && !chunk.policyRetried) {
               chunk.policyRetried = true
               addLog(
                 scan,
@@ -2908,10 +2999,12 @@ class Scheduler {
 
               // Request Attempt 2: Sanitized Retry with neutral prompt
               try {
-                raw = await mapChunkRequest(lane.ai, m.id, sanitizedShortUri, sanitizedUploaded.uri, CHUNK_MAP_SANITIZED_PROMPT)
+                const sanitizedRes = await mapChunkRequest(lane.ai, m.id, sanitizedShortUri, sanitizedUploaded.uri, CHUNK_MAP_SANITIZED_PROMPT)
+                raw = sanitizedRes.text
                 const usedRetry = incrementModelUsage(m.id, lane.apiKey)
                 st.usedToday = usedRetry
                 chunk.requestCount = (chunk.requestCount || 0) + 1
+                job.laneFirstSuccess.add(lane.idx)
                 const outcome = globalGeminiCoordinator.recordChunkSuccess(lane.apiKey, m.id, chunkLockId)
                 job.cooldownUntil[rk] = outcome.cooldownUntil
                 job.nextFreeAt[rk] = outcome.cooldownUntil
@@ -2976,34 +3069,8 @@ class Scheduler {
               )
               continue
             } else {
-              // On temporary server errors (503 / overload / 5xx), do ONE retry with 2s backoff
-              const isServerOverload = /overload|busy|503|500|internal|try again|temporarily/i.test(re.message)
-              if (!isServerOverload) {
-                globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
-                throw reqErr
-              }
-
-              addLog(scan, 'warn', `${minutePrefix}Chunk ${chunkIndex}: Gemini model server busy (503/overload) on ${m.id} (key ${lane.idx}) — retrying in 2s...`)
-              this.mark(job)
-              await sleep(2000)
-              try {
-                raw = await mapChunkRequest(lane.ai, m.id, effectiveShortUri, effectiveUploadedUri, effectivePrompt)
-                const usedRetry = incrementModelUsage(m.id, lane.apiKey)
-                st.usedToday = usedRetry
-                chunk.requestCount = (chunk.requestCount || 0) + 1
-                const outcome = globalGeminiCoordinator.recordChunkSuccess(lane.apiKey, m.id, chunkLockId)
-                job.cooldownUntil[rk] = outcome.cooldownUntil
-                job.nextFreeAt[rk] = outcome.cooldownUntil
-                st.state = 'cooling'
-                st.cooldownUntil = outcome.cooldownUntil
-                this.mark(job)
-                break
-              } catch (retry503Err) {
-                chunk.requestCount = (chunk.requestCount || 0) + 1
-                this.mark(job)
-                globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
-                throw retry503Err
-              }
+              globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
+              throw reqErr
             }
           }
         }
@@ -3058,7 +3125,7 @@ class Scheduler {
         }
         this.mark(job)
       } catch (err) {
-        const e = err instanceof GeminiError ? err : classifyError(err)
+        const e = err instanceof GeminiError ? err : classifyError(err, { keyIdx: lane.idx, model: m.id, requestKind: 'chunk_map' })
 
         // Always record error & diagnostic in chunk output so user can click 'AI output' and see what happened.
         this.recordChunkOutput(
@@ -3077,6 +3144,8 @@ class Scheduler {
 
         const isTransientInfra =
           isPolicyBlocked ||
+          e.kind === 'overloaded' ||
+          e.kind === 'model_unavailable' ||
           e.kind === 'rate' ||
           e.kind === 'rpd' ||
           e.kind === 'unavailable' ||
@@ -3101,7 +3170,7 @@ class Scheduler {
           chunk.status = 'failed'
           addLog(scan, 'error', `${minutePrefix}Chunk ${chunkIndex} reached max retry limit (${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} attempts) — stopped: ${e.message.slice(0, 140)}`)
         } else if (e.kind === 'invalid_key') {
-          const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
+          const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
           if (laneState) {
             laneState.status = 'error'
             laneState.lastError = 'API key invalid or expired'
@@ -3109,13 +3178,35 @@ class Scheduler {
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
           addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — disabled for this scan; Chunk ${chunkIndex} re-queued for another key`)
+        } else if (e.kind === 'overloaded') {
+          const quotaOutcome = globalGeminiCoordinator.handleQuotaOrRateError(
+            lane.apiKey,
+            m.id,
+            0,
+            m.rpd || 20,
+            e,
+            undefined,
+            lane.idx,
+          )
+          const waitMs = quotaOutcome.waitSec * 1000
+          job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + waitMs
+          const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
+          if (laneState) {
+            const ms = laneState.models.find((item) => item.id === m.id)
+            if (ms) ms.state = 'cooling'
+          }
+          addLog(scan, 'warn', `${m.id} (key ${lane.idx}): 503 overloaded — switching to another lane; Chunk ${chunkIndex} re-queued.`)
+          chunk.status = 'pending'
+          job.queue.push(chunkIndex)
         } else if (e.kind === 'rpd' || e.kind === 'rate') {
           const quotaOutcome = globalGeminiCoordinator.handleQuotaOrRateError(
             lane.apiKey,
             m.id,
             0,
             m.rpd || 20,
-            e.kind === 'rpd',
+            e,
+            undefined,
+            lane.idx,
           )
           if (quotaOutcome.action === 'exhausted') {
             setModelExhausted(m.id, lane.apiKey)
@@ -3127,7 +3218,7 @@ class Scheduler {
             addLog(scan, 'warn', `${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Model set aside today; remaining models on key ${lane.idx} continue. Chunk ${chunkIndex} re-queued.`)
           } else {
             job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + CHUNK_COOLDOWN_MS
-            const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
+            const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
             if (laneState) {
               const ms = laneState.models.find((item) => item.id === m.id)
               if (ms) ms.state = 'cooling'

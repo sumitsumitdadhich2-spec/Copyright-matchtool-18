@@ -55,8 +55,15 @@ interface GlobalLaneState {
   nextFreeAt: number
   cooldownUntil: number
   consecutiveQuotaErrors?: number
+  firstRpdErrorAt?: number
   isExhausted: boolean
   waiters: LaneWaiter[]
+}
+
+interface BreakerFailureEvent {
+  time: number
+  keyHash: string
+  failureClass: 'rate' | 'overloaded' | 'rpd'
 }
 
 class GlobalGeminiCoordinator {
@@ -64,6 +71,15 @@ class GlobalGeminiCoordinator {
   private verifyModelStates = new Map<string, VerifyModelState>()
   private chunkModelStates = new Map<string, ChunkModelState>()
   private currentActiveDay = geminiUsageDay()
+  private breakerEvents: BreakerFailureEvent[] = []
+  private globalPauseUntil: number = 0
+  private breakerBackoffMinutes = [2, 4, 8, 10]
+  private breakerBackoffIndex = 0
+  private activePauseClass: 'rate' | 'overloaded' | 'rpd' | null = null
+  private isProbeInFlight = false
+  private probeLaneKey: string | null = null
+  private exhaustedLogSet = new Set<string>()
+  private rateSpikeLogUntil = new Map<string, number>()
 
   /**
    * Checks if the date has rolled over (midnight Pacific Time).
@@ -74,9 +90,12 @@ class GlobalGeminiCoordinator {
     if (today !== this.currentActiveDay) {
       console.log(`[Global Coordinator] Daily quota rollover detected (${this.currentActiveDay} -> ${today}). Resetting all lane exhaustion flags!`)
       this.currentActiveDay = today
+      this.exhaustedLogSet.clear()
+      this.rateSpikeLogUntil.clear()
       for (const lane of this.lanes.values()) {
         lane.isExhausted = false
         lane.cooldownUntil = 0
+        delete lane.firstRpdErrorAt
       }
       this.verifyModelStates.clear()
       this.chunkModelStates.clear()
@@ -143,14 +162,14 @@ class GlobalGeminiCoordinator {
     return `${apiKeyHash(apiKey)}:${modelId}:${slot}`
   }
 
-  private getOrCreateLane(apiKey: string, modelId: string, slot: number = 0, keyIdx: number = 1): GlobalLaneState {
+  private getOrCreateLane(apiKey: string, modelId: string, slot: number = 0, keyIdx?: number): GlobalLaneState {
     const key = this.getLaneKey(apiKey, modelId, slot)
     let lane = this.lanes.get(key)
     if (!lane) {
       lane = {
         laneKey: key,
         keyHash: apiKeyHash(apiKey),
-        keyIdx,
+        keyIdx: typeof keyIdx === 'number' && keyIdx > 0 ? keyIdx : 0,
         modelId,
         slot,
         activeScanId: null,
@@ -167,7 +186,9 @@ class GlobalGeminiCoordinator {
       }
       this.lanes.set(key, lane)
     }
-    if (keyIdx > 0) lane.keyIdx = keyIdx
+    if (typeof keyIdx === 'number' && keyIdx > 0) {
+      lane.keyIdx = keyIdx
+    }
     return lane
   }
 
@@ -313,6 +334,43 @@ class GlobalGeminiCoordinator {
         }
 
         const now = Date.now()
+
+        // Provider-wide breaker check
+        if (this.globalPauseUntil > now) {
+          const waitMs = this.globalPauseUntil - now
+          const waitSec = Math.ceil(waitMs / 1000)
+          onWait?.(
+            `[Global Coordinator] Google-wide ${this.activePauseClass || 'incident'} pause active (${waitSec}s remaining). Waiting for provider recovery...`,
+            waitSec,
+          )
+          setTimeout(() => {
+            if (isStopping && isStopping()) {
+              reject(new Error('Stop requested during provider-wide pause'))
+              return
+            }
+            void tryAcquireOrQueue()
+          }, Math.min(waitMs + 50, 4000))
+          return
+        }
+
+        // Post-pause probe: allow exactly 1 probe request through before ramping up
+        if (this.activePauseClass !== null) {
+          if (!this.isProbeInFlight) {
+            this.isProbeInFlight = true
+            this.probeLaneKey = lane.laneKey
+            console.log(`[Global Coordinator] Google-wide pause elapsed. Letting exactly 1 probe request through on Key ${lane.keyIdx} · ${modelId}...`)
+          } else if (this.probeLaneKey !== lane.laneKey) {
+            onWait?.(`[Global Coordinator] Waiting for single probe request to verify Google recovery before ramping up...`, 2)
+            setTimeout(() => {
+              if (isStopping && isStopping()) {
+                reject(new Error('Stop requested while waiting for probe'))
+                return
+              }
+              void tryAcquireOrQueue()
+            }, 1500)
+            return
+          }
+        }
 
         // Verifier-specific batch rules & 429 priority retry locks (Coordinator level):
         if (isVerify) {
@@ -479,6 +537,13 @@ class GlobalGeminiCoordinator {
             reject,
             isStopping,
           })
+          return
+        }
+
+        // Re-read lane's cooldown and global pause state before acquiring exclusively
+        const checkNow = Date.now()
+        if (this.globalPauseUntil > checkNow || lane.cooldownUntil > checkNow || lane.nextFreeAt > checkNow) {
+          void tryAcquireOrQueue()
           return
         }
 
@@ -692,6 +757,61 @@ class GlobalGeminiCoordinator {
   public recordSuccess(apiKey: string, modelId: string, slot: number = 0) {
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
     lane.consecutiveQuotaErrors = 0
+    delete lane.firstRpdErrorAt
+
+    if (this.activePauseClass !== null) {
+      console.log(`[Global Coordinator] Provider probe succeeded! Resuming normal ramp-up across all keys.`)
+      this.activePauseClass = null
+      this.isProbeInFlight = false
+      this.probeLaneKey = null
+      this.breakerBackoffIndex = 0
+      this.breakerEvents = []
+    }
+  }
+
+  /** Record a breaker failure and trigger provider-wide pause if threshold met */
+  public recordBreakerFailure(
+    apiKey: string,
+    modelId: string,
+    failureClass: 'rate' | 'overloaded' | 'rpd',
+    recordedUsage: number,
+    rpdCap: number,
+  ) {
+    if (recordedUsage >= rpdCap) return
+    const now = Date.now()
+    const kh = apiKeyHash(apiKey)
+    this.breakerEvents.push({ time: now, keyHash: kh, failureClass })
+    this.breakerEvents = this.breakerEvents.filter((e) => now - e.time <= 60_000)
+
+    const activeKeys = new Set<string>()
+    for (const lane of this.lanes.values()) {
+      if ((lane.activeSince && now - lane.activeSince <= 60_000) || (lane.lastCompletedAt && now - lane.lastCompletedAt <= 60_000)) {
+        activeKeys.add(lane.keyHash)
+      }
+    }
+    for (const e of this.breakerEvents) {
+      activeKeys.add(e.keyHash)
+    }
+
+    const classKeys = new Set<string>()
+    for (const e of this.breakerEvents) {
+      if (e.failureClass === failureClass) {
+        classKeys.add(e.keyHash)
+      }
+    }
+
+    const activeCount = activeKeys.size
+    if (classKeys.size >= 4 && activeCount > 0 && classKeys.size / activeCount >= 0.5) {
+      if (now >= this.globalPauseUntil) {
+        const pauseMin = this.breakerBackoffMinutes[Math.min(this.breakerBackoffIndex, this.breakerBackoffMinutes.length - 1)]
+        this.breakerBackoffIndex = Math.min(this.breakerBackoffMinutes.length - 1, this.breakerBackoffIndex + 1)
+        this.globalPauseUntil = now + pauseMin * 60_000
+        this.activePauseClass = failureClass
+        this.isProbeInFlight = false
+        this.probeLaneKey = null
+        console.log(`Google-wide ${failureClass} event, pausing ${pauseMin} min`)
+      }
+    }
   }
 
   /** Report a 429 Rate Limit error on a lane across the entire app */
@@ -710,9 +830,13 @@ class GlobalGeminiCoordinator {
       }
     }
 
-    console.log(
-      `[Global Coordinator] 429 Lock on ${modelId} (Key ${lane.keyIdx}, Hash: ${kh.slice(0, 6)}): Locked for ${(cooldownMs / 1000).toFixed(1)}s (until ${new Date(coolUntil).toLocaleTimeString()}). All other requests blocked on this model.`,
-    )
+    const spikeKey = `${kh}|${modelId}`
+    if (now >= (this.rateSpikeLogUntil.get(spikeKey) || 0)) {
+      this.rateSpikeLogUntil.set(spikeKey, coolUntil)
+      console.log(
+        `[Global Coordinator] 429 Lock on ${modelId} (Key ${lane.keyIdx}, Hash: ${kh.slice(0, 6)}): Locked for ${(cooldownMs / 1000).toFixed(1)}s (until ${new Date(coolUntil).toLocaleTimeString()}). All other requests blocked on this model.`,
+      )
+    }
   }
 
   /**
@@ -922,15 +1046,15 @@ class GlobalGeminiCoordinator {
    * 1. Never disable the entire API key! Only isolate this specific model on this key.
    * 2. Temporary rate limit spikes (429 RPM/TPM) or server high demand (503) are NEVER daily exhausted!
    *    They are put in cooldown for the exact Google delay + 5s buffer lock, and retried.
-   * 3. Only mark as daily exhausted if actual usedToday >= rpdCap OR if Google sends an explicit daily quota error
-   *    and usage is near/at the cap.
+   * 3. Mark exhausted ONLY if (a) used >= rpdCap, or (b) error.kind === 'rpd' from structured PerDay quotaId
+   *    AND this lane had a previous 'rpd' error at least 10 minutes earlier.
    */
   public handleQuotaOrRateError(
     apiKey: string,
     modelId: string,
     slot: number = 0,
     rpdCap: number = 20,
-    isExplicitDailyMsg: boolean = false,
+    errorOrKind?: unknown,
     cooldownMsOverride?: number,
     keyIdx?: number,
   ): {
@@ -939,14 +1063,30 @@ class GlobalGeminiCoordinator {
     reason: string
   } {
     this.checkDayRollover()
-    const lane = this.getOrCreateLane(apiKey, modelId, slot, keyIdx ?? 1)
-    if (keyIdx !== undefined && keyIdx > 0) {
-      lane.keyIdx = keyIdx
-    }
+    const lane = this.getOrCreateLane(apiKey, modelId, slot, keyIdx)
     const used = getModelUsage(modelId, apiKey)
     const effectiveCooldownMs = cooldownMsOverride !== undefined && cooldownMsOverride > 0
       ? cooldownMsOverride
       : CHUNK_COOLDOWN_MS
+
+    const errKind: string =
+      typeof errorOrKind === 'object' && errorOrKind !== null && 'kind' in (errorOrKind as Record<string, unknown>)
+        ? String((errorOrKind as { kind: string }).kind)
+        : typeof errorOrKind === 'string'
+          ? errorOrKind
+          : errorOrKind === true
+            ? 'rpd'
+            : 'rate'
+
+    // If probe failed during pause:
+    if (this.activePauseClass !== null && this.isProbeInFlight && this.probeLaneKey === lane.laneKey) {
+      this.isProbeInFlight = false
+      this.probeLaneKey = null
+      const pauseMin = this.breakerBackoffMinutes[Math.min(this.breakerBackoffIndex, this.breakerBackoffMinutes.length - 1)]
+      this.breakerBackoffIndex = Math.min(this.breakerBackoffMinutes.length - 1, this.breakerBackoffIndex + 1)
+      this.globalPauseUntil = Date.now() + pauseMin * 60_000
+      console.log(`Google-wide ${this.activePauseClass} event, pausing ${pauseMin} min`)
+    }
 
     // 1. If actual recorded usage has reached or exceeded the daily cap, it is genuinely exhausted
     if (used >= rpdCap) {
@@ -958,27 +1098,46 @@ class GlobalGeminiCoordinator {
       }
     }
 
-    // 2. If it is explicitly a daily limit error from Google and usage is near cap:
-    if (isExplicitDailyMsg && (used >= Math.max(1, rpdCap - 2) || (lane.consecutiveQuotaErrors || 0) >= 3)) {
-      this.reportExhausted(apiKey, modelId, slot, rpdCap)
-      return {
-        action: 'exhausted',
-        waitSec: 0,
-        reason: `Daily quota confirmed exhausted on ${modelId} (Key ${lane.keyIdx}) (${used}/${rpdCap} RPD)`,
+    // 2. Mark exhausted ONLY if error.kind === 'rpd' from structured PerDay quotaId
+    // AND this lane had a previous 'rpd' error at least 10 minutes earlier
+    if (errKind === 'rpd') {
+      const now = Date.now()
+      if (lane.firstRpdErrorAt && now - lane.firstRpdErrorAt >= 10 * 60_000) {
+        this.reportExhausted(apiKey, modelId, slot, rpdCap)
+        return {
+          action: 'exhausted',
+          waitSec: 0,
+          reason: `Daily quota confirmed exhausted on ${modelId} (Key ${lane.keyIdx}) (${used}/${rpdCap} RPD)`,
+        }
+      } else {
+        if (!lane.firstRpdErrorAt) {
+          lane.firstRpdErrorAt = now
+        }
+        const cdMs = Math.max(cooldownMsOverride || 0, 10 * 60_000)
+        this.reportRateLimit(apiKey, modelId, cdMs, slot)
+        this.recordBreakerFailure(apiKey, modelId, 'rpd', used, rpdCap)
+        const waitSec = Math.ceil(cdMs / 1000)
+        return {
+          action: 'cooldown',
+          waitSec,
+          reason: `First RPD error on ${modelId} (Key ${lane.keyIdx}, used ${used}/${rpdCap} RPD) — setting 10 min cooldown probe before marking exhausted`,
+        }
       }
     }
 
-    // 3. For ALL other rate limits (429 RPM/TPM) and server spikes (503 high demand):
-    // Put ONLY this model in cooldown (Google delay + 5s buffer lock) and retry after lock expires!
-    lane.consecutiveQuotaErrors = (lane.consecutiveQuotaErrors || 0) + 1
+    // 3. For ALL other rate limits (429 RPM/TPM) and server spikes (503 overloaded):
+    // 'overloaded' and 'rate' must never increment consecutiveQuotaErrors toward exhaustion!
     lane.isExhausted = false
+    const failureClass: 'rate' | 'overloaded' = errKind === 'overloaded' ? 'overloaded' : 'rate'
     this.reportRateLimit(apiKey, modelId, effectiveCooldownMs, slot)
+    this.recordBreakerFailure(apiKey, modelId, failureClass, used, rpdCap)
     const waitSec = Math.ceil(effectiveCooldownMs / 1000)
 
+    const label = failureClass === 'overloaded' ? '503 overloaded' : 'Rate/quota spike'
     return {
       action: 'cooldown',
       waitSec,
-      reason: `Rate/quota spike on ${modelId} (Key ${lane.keyIdx}, used ${used}/${rpdCap} RPD) — locked for ${waitSec}s (+5s buffer) before retry`,
+      reason: `${label} on ${modelId} (Key ${lane.keyIdx}, used ${used}/${rpdCap} RPD) — locked for ${waitSec}s (+5s buffer) before retry`,
     }
   }
 
@@ -1002,9 +1161,16 @@ class GlobalGeminiCoordinator {
       }
     }
 
+    const day = geminiUsageDay()
+    const logKey = `${day}|${kh}|${modelId}`
+    if (!this.exhaustedLogSet.has(logKey)) {
+      this.exhaustedLogSet.add(logKey)
+      console.log(`[Global Coordinator] Key ${lane.keyIdx} (${modelId}) daily quota (${rpdCap} RPD) exhausted for today (${day}).`)
+    }
+
     // Persist to counters.json so subsequent workers/processes know this model is quota-capped today
     try {
-      setModelExhausted(modelId, apiKey, rpdCap)
+      setModelExhausted(modelId, apiKey)
     } catch {}
   }
 

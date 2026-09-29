@@ -92,7 +92,7 @@ const COUNTERS_FILE = path.join(DATA_DIR, 'counters.json')
 interface CountersData {
   _lastActiveDay?: string
   _lastResetTime?: number
-  [key: string]: number | string | boolean | undefined
+  [key: string]: number | string | boolean | { at: number } | undefined
 }
 
 let cachedCounters: CountersData | null = null
@@ -178,13 +178,22 @@ export function isModelDailyQuotaExhausted(model: string, apiKey: string, rpdCap
   checkDailyReset()
   const counters = getCachedCounters()
   const usage = getModelUsage(model, apiKey)
-  if (counters[exhaustedKey(model, apiKey)] === true) {
-    // Verify against actual genuine requests today. If usage is under cap, do not trust spurious flag!
-    if (usage < rpdCap) {
+  const exhVal = counters[exhaustedKey(model, apiKey)]
+  if (exhVal !== undefined && exhVal !== null) {
+    let exhAt = 0
+    if (typeof exhVal === 'object' && exhVal !== null && 'at' in exhVal) {
+      exhAt = Number((exhVal as { at: number }).at) || 0
+    } else if (typeof exhVal === 'number') {
+      exhAt = exhVal
+    }
+    const now = Date.now()
+    if (exhAt > 0 && now - exhAt > 45 * 60_000) {
+      // Expired after 45 minutes — delete flag to allow ONE probe request
       delete counters[exhaustedKey(model, apiKey)]
       saveCounters(counters)
       return false
     }
+    // Flag exists and is not expired: return true. Do NOT delete because usage < rpdCap!
     return true
   }
   return usage >= rpdCap
@@ -193,7 +202,7 @@ export function isModelDailyQuotaExhausted(model: string, apiKey: string, rpdCap
 export function getModelExhausted(model: string, apiKey: string): boolean {
   checkDailyReset()
   const counters = getCachedCounters()
-  return counters[exhaustedKey(model, apiKey)] === true
+  return Boolean(counters[exhaustedKey(model, apiKey)])
 }
 
 export function incrementModelUsage(model: string, apiKey: string): number {
@@ -227,9 +236,8 @@ export function decrementModelUsage(model: string, apiKey: string): number {
 export function setModelExhausted(model: string, apiKey: string) {
   checkDailyReset()
   const counters = getCachedCounters()
-  // Store explicit exhaustion flag so scheduler stops using it today,
-  // without faking artificial counts in counters[key]!
-  counters[exhaustedKey(model, apiKey)] = true
+  // Save flag value as {at: timestamp}
+  counters[exhaustedKey(model, apiKey)] = { at: Date.now() }
   saveCounters(counters)
 }
 
@@ -252,55 +260,17 @@ export function clearAllExhaustedFlags(): void {
 /**
  * Reconciles today's counters directly from all recorded scans.
  * Ensures usage reflects ONLY genuine completed successful requests.
- * Clears spurious exhaustion flags if no scans exist or if actual usage < cap.
+ * Deletes only flags from previous days; never deletes today's flags because usage < cap.
  */
 export function reconcileTodayCounters(): void {
   ensureDirs()
   const today = todayKey()
   const counters = getCachedCounters()
 
-  // Clean all spurious exhaustion flags from previous days or unconfirmed states
+  // Clean only flags from previous days; never delete today's flags because usage < cap
   for (const k of Object.keys(counters)) {
     if (k.startsWith('_exh|') && !k.includes(`|${today}|`)) {
       delete counters[k]
-    }
-  }
-
-  // Inspect existing scans
-  const scans = listScans()
-  const todayScans = scans.filter((s) => {
-    const d1 = geminiUsageDay(new Date(s.createdAt))
-    return d1 === today
-  })
-
-  if (todayScans.length === 0) {
-    // If no scans ran today, usage across all models is 0 and no model is exhausted!
-    for (const k of Object.keys(counters)) {
-      if (k.startsWith('_last')) continue
-      if (k.includes(`|${today}|`)) {
-        delete counters[k]
-      }
-    }
-    saveCounters(counters)
-    return
-  }
-
-  // If scans exist, verify exhaustion flags against actual RPD caps
-  for (const k of Object.keys(counters)) {
-    if (k.startsWith('_exh|')) {
-      const parts = k.split('|')
-      if (parts.length >= 4) {
-        const model = parts[1]
-        const h = parts[3]
-        const m = MODEL_POOL.find((item) => item.id === model)
-        const rpd = m ? m.rpd : 20
-        const usageKey = `${model}|${today}|${h}`
-        const currentUsage = (counters[usageKey] as number) || 0
-        if (currentUsage < rpd) {
-          // If usage is below cap, it is not truly exhausted
-          delete counters[k]
-        }
-      }
     }
   }
 
@@ -514,5 +484,20 @@ export function scanMediaDir(id: string): string {
 
 export function addLog(scan: Scan, level: LogEntry['level'], msg: string) {
   if (!Array.isArray(scan.logs)) scan.logs = []
-  scan.logs.push({ t: Date.now(), level, msg })
+  const now = Date.now()
+  const last = scan.logs[scan.logs.length - 1]
+
+  // Aggregate repeated identical lines per model per minute with a count
+  if (last && now - last.t < 60_000 && last.level === level) {
+    const baseOf = (s: string) => s.replace(/\s*\(x\d+\)$/, '').trim()
+    if (baseOf(last.msg) === baseOf(msg)) {
+      const match = last.msg.match(/\s*\(x(\d+)\)$/)
+      const count = match ? parseInt(match[1], 10) + 1 : 2
+      last.msg = `${baseOf(msg)} (x${count})`
+      last.t = now
+      return
+    }
+  }
+
+  scan.logs.push({ t: now, level, msg })
 }

@@ -17,9 +17,18 @@ const GEN_CONFIG = {
     { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
     { category: HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY, threshold: HarmBlockThreshold.BLOCK_NONE },
   ],
-} as const
+}
 
-export type GeminiErrorKind = 'rpd' | 'rate' | 'unavailable' | 'invalid_key' | 'empty' | 'policy_blocked' | 'other'
+export type GeminiErrorKind =
+  | 'rpd'
+  | 'rate'
+  | 'unavailable'
+  | 'invalid_key'
+  | 'empty'
+  | 'policy_blocked'
+  | 'overloaded'
+  | 'model_unavailable'
+  | 'other'
 
 /** Extra safety buffer added on top of Google Gemini's requested retryDelay (in ms) */
 export const GOOGLE_RETRY_SAFETY_BUFFER_MS = 5_000
@@ -27,11 +36,75 @@ export const GOOGLE_RETRY_SAFETY_BUFFER_MS = 5_000
 export class GeminiError extends Error {
   kind: GeminiErrorKind
   retryDelayMs?: number
+  httpStatus?: number
+  googleStatus?: string
+  quotaId?: string
+  quotaValue?: string
 
-  constructor(kind: GeminiErrorKind, message: string, retryDelayMs?: number) {
+  constructor(
+    kind: GeminiErrorKind,
+    message: string,
+    retryDelayMs?: number,
+    meta?: {
+      httpStatus?: number
+      googleStatus?: string
+      quotaId?: string
+      quotaValue?: string
+    },
+  ) {
     super(message)
     this.kind = kind
     this.retryDelayMs = retryDelayMs
+    if (meta) {
+      this.httpStatus = meta.httpStatus
+      this.googleStatus = meta.googleStatus
+      this.quotaId = meta.quotaId
+      this.quotaValue = meta.quotaValue
+    }
+  }
+}
+
+export interface RawGeminiErrorRecord {
+  time: number
+  keyIdx: number
+  model: string
+  requestKind: string
+  httpStatus?: number
+  quotaId?: string
+  quotaValue?: string
+  rawSnippet: string
+}
+
+const GEMINI_ERRORS_FILE = path.join(process.cwd(), 'data', 'gemini-errors.jsonl')
+
+export function logGeminiRawError(record: RawGeminiErrorRecord): void {
+  try {
+    const dir = path.dirname(GEMINI_ERRORS_FILE)
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+    const line = JSON.stringify(record) + '\n'
+    fs.appendFileSync(GEMINI_ERRORS_FILE, line, 'utf8')
+  } catch (err) {
+    console.error('Failed to append to gemini-errors.jsonl:', err)
+  }
+}
+
+export function getRecentGeminiErrors(limit = 50): RawGeminiErrorRecord[] {
+  try {
+    if (!fs.existsSync(GEMINI_ERRORS_FILE)) return []
+    const content = fs.readFileSync(GEMINI_ERRORS_FILE, 'utf8')
+    const lines = content.trim().split('\n').filter(Boolean)
+    const records: RawGeminiErrorRecord[] = []
+    const start = Math.max(0, lines.length - limit)
+    for (let i = lines.length - 1; i >= start; i--) {
+      try {
+        records.push(JSON.parse(lines[i]))
+      } catch {
+        // ignore malformed line
+      }
+    }
+    return records
+  } catch {
+    return []
   }
 }
 
@@ -458,8 +531,8 @@ async function uploadResumableWithProgress(
 export async function uploadVideo(
   ai: GoogleGenAI,
   filePath: string,
-  onProgress?: ((p: UploadProgress) => void) | unknown,
-  isStopping?: (() => boolean) | unknown,
+  onProgress?: (p: UploadProgress) => void,
+  isStopping?: () => boolean,
 ): Promise<{ uri: string; name: string }> {
   const safeProgress = typeof onProgress === 'function' ? (onProgress as (p: UploadProgress) => void) : undefined
   const safeStopping = typeof isStopping === 'function' ? (isStopping as () => boolean) : undefined
@@ -503,10 +576,10 @@ export async function uploadVideo(
   const processingStart = Date.now()
   // FAST POLLING with 20m deadline: check every 2.5s until ACTIVE
   while (f.state === 'PROCESSING') {
-    if (isStopping && isStopping()) throw new Error('Stopped')
+    if (safeStopping && safeStopping()) throw new Error('Stopped')
     if (Date.now() > deadline) throw new GeminiError('other', 'File processing timed out (20 min exceeded)')
     const elapsedSec = Math.round((Date.now() - processingStart) / 1000)
-    onProgress?.({
+    safeProgress?.({
       bytesUploaded: 1,
       totalBytes: 1,
       pct: 100,
@@ -526,7 +599,7 @@ export async function uploadVideo(
     const detail = errObj?.message ? ` (${errObj.message})` : ''
     throw new GeminiError('other', `File upload failed (state=${f.state}${detail})`)
   }
-  onProgress?.({
+  safeProgress?.({
     bytesUploaded: 1,
     totalBytes: 1,
     pct: 100,
@@ -626,8 +699,26 @@ export async function deleteAllFilesOnKey(apiKey: string): Promise<{ deleted: nu
   }
 }
 
-export function classifyError(err: unknown): GeminiError {
-  if (err instanceof GeminiError) return err
+export function classifyError(
+  err: unknown,
+  ctx?: { keyIdx?: number; model?: string; requestKind?: string },
+): GeminiError {
+  if (err instanceof GeminiError) {
+    if ((err.httpStatus === 429 || err.httpStatus === 503 || err.kind === 'rate' || err.kind === 'overloaded' || err.kind === 'rpd') && ctx) {
+      logGeminiRawError({
+        time: Date.now(),
+        keyIdx: ctx.keyIdx || 0,
+        model: ctx.model || 'unknown',
+        requestKind: ctx.requestKind || 'unknown',
+        httpStatus: err.httpStatus,
+        quotaId: err.quotaId,
+        quotaValue: err.quotaValue,
+        rawSnippet: err.message.slice(0, 400),
+      })
+    }
+    return err
+  }
+
   let msg = err instanceof Error ? err.message : String(err)
   if (err instanceof Error && 'cause' in err && err.cause) {
     const c = err.cause
@@ -636,9 +727,87 @@ export function classifyError(err: unknown): GeminiError {
       msg = `${msg} (${causeMsg})`
     }
   }
+
+  let httpStatus: number | undefined
+  let googleStatus: string | undefined
+  let quotaId: string | undefined
+  let quotaValue: string | undefined
+
+  // 1. Structured data from err object
+  if (err && typeof err === 'object') {
+    const obj = err as Record<string, unknown>
+    if (typeof obj.status === 'number') httpStatus = obj.status
+    else if (typeof obj.status === 'string') googleStatus = obj.status
+
+    if (typeof obj.code === 'number') httpStatus = obj.code
+    else if (typeof obj.code === 'string' && !googleStatus) googleStatus = obj.code
+
+    const errObj = (obj.error && typeof obj.error === 'object' ? obj.error : obj) as Record<string, unknown>
+    if (typeof errObj.code === 'number' && !httpStatus) httpStatus = errObj.code
+    if (typeof errObj.status === 'string' && !googleStatus) googleStatus = errObj.status
+
+    const details = Array.isArray(errObj.details) ? errObj.details : Array.isArray(obj.details) ? obj.details : null
+    if (Array.isArray(details)) {
+      for (const d of details) {
+        if (d && typeof d === 'object') {
+          const item = d as Record<string, unknown>
+          if (Array.isArray(item.violations)) {
+            for (const v of item.violations) {
+              if (v && typeof v === 'object') {
+                const viol = v as Record<string, unknown>
+                if (viol.quotaId) quotaId = String(viol.quotaId)
+                if (viol.quotaMetric) quotaId = quotaId || String(viol.quotaMetric)
+                if (viol.quotaValue !== undefined) quotaValue = String(viol.quotaValue)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Structured data from embedded JSON in message string
+  try {
+    const jsonMatch = msg.match(/\{[\s\S]*"error"[\s\S]*\}/) || msg.match(/\{[\s\S]*"details"[\s\S]*\}/)
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0])
+      const errObj = (parsed.error && typeof parsed.error === 'object' ? parsed.error : parsed) as Record<string, unknown>
+      if (typeof errObj.code === 'number' && !httpStatus) httpStatus = errObj.code
+      if (typeof errObj.status === 'string' && !googleStatus) googleStatus = errObj.status
+      const details = Array.isArray(errObj.details) ? errObj.details : Array.isArray(parsed.details) ? parsed.details : null
+      if (Array.isArray(details)) {
+        for (const d of details) {
+          if (d && typeof d === 'object') {
+            const item = d as Record<string, unknown>
+            if (Array.isArray(item.violations)) {
+              for (const v of item.violations) {
+                if (v && typeof v === 'object') {
+                  const viol = v as Record<string, unknown>
+                  if (viol.quotaId) quotaId = String(viol.quotaId)
+                  if (viol.quotaMetric) quotaId = quotaId || String(viol.quotaMetric)
+                  if (viol.quotaValue !== undefined) quotaValue = String(viol.quotaValue)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // ignore embedded JSON parse failures
+  }
+
+  if (!httpStatus) {
+    const statusMatch = msg.match(/\b(?:status|code)["':\s]+(429|500|502|503|504)\b/i)
+    if (statusMatch) {
+      httpStatus = parseInt(statusMatch[1], 10)
+    }
+  }
+
   const googleRetryDelayMs = extractGoogleRetryDelayMs(err)
   const lower = msg.toLowerCase()
-  // Invalid or expired API Key — must disable the lane immediately and not count attempts against the item.
+
+  // 1. invalid_key
   if (
     lower.includes('api key not valid') ||
     lower.includes('api_key_invalid') ||
@@ -646,68 +815,10 @@ export function classifyError(err: unknown): GeminiError {
     lower.includes('key expired') ||
     (lower.includes('invalid_argument') && lower.includes('api key'))
   ) {
-    return new GeminiError('invalid_key', msg)
-  }
-  // Model retired / not accessible for this API key — permanently remove from pool for the day.
-  if (
-    lower.includes('no longer available') ||
-    (lower.includes('404') && (lower.includes('not found') || lower.includes('models/')))
-  ) {
-    return new GeminiError('unavailable', msg)
-  }
-  // Server busy or temporary unavailable (503 / 500 / high demand / overloaded)
-  if (
-    lower.includes('503') ||
-    lower.includes('500') ||
-    lower.includes('high demand') ||
-    lower.includes('service unavailable') ||
-    lower.includes('temporarily unavailable') ||
-    lower.includes('overloaded') ||
-    lower.includes('fetch failed')
-  ) {
-    return new GeminiError('rate', msg, googleRetryDelayMs ?? undefined)
+    return new GeminiError('invalid_key', msg, undefined, { httpStatus, googleStatus, quotaId, quotaValue })
   }
 
-  // 1. Check if it's explicitly a TEMPORARY minute rate limit (TPM or RPM).
-  // Google Gemini API specifically names minute quotas with "_per_minute_" or "per minute":
-  // e.g. "generate_content_tokens_per_model_per_minute_per_user" (TPM 250k)
-  // or "generate_content_requests_per_model_per_minute_per_user" (RPM 15)
-  // or "Quota exceeded for quota metric 'GenerateContent requests per minute per user'"
-  const isMinuteRateLimit =
-    lower.includes('per_minute') ||
-    lower.includes('per minute') ||
-    lower.includes('perminute') ||
-    lower.includes('rpm') ||
-    lower.includes('tpm') ||
-    lower.includes('_per_minute_') ||
-    lower.includes('minute_per_user')
-
-  // 2. Check if it's explicitly a DAILY quota exhaustion (RPD or 25M daily tokens).
-  // This must NEVER match minute-based rate limits!
-  const isExplicitDaily =
-    !isMinuteRateLimit &&
-    (
-      lower.includes('generaterequestsperday') ||
-      lower.includes('generatetokensperday') ||
-      lower.includes('generate_requests_per_day') ||
-      lower.includes('generate_content_requests_per_model_per_day') ||
-      lower.includes('generate_content_tokens_per_model_per_day') ||
-      lower.includes('requests per day') ||
-      lower.includes('request sper day') ||
-      lower.includes('requests_per_day') ||
-      lower.includes('tokens per day') ||
-      lower.includes('tokens_per_day') ||
-      lower.includes('_per_day_') ||
-      lower.includes('daily requests') ||
-      (lower.includes('daily') && lower.includes('quota')) ||
-      (lower.includes('limit: 20') && lower.includes('daily')) ||
-      (lower.includes('limit: 25000000') || lower.includes('limit: 50000000') || lower.includes('limit: 100000000'))
-    )
-
-  if (isExplicitDaily) {
-    return new GeminiError('rpd', msg)
-  }
-
+  // 2. policy_blocked
   if (
     lower.includes('prohibited_content') ||
     lower.includes('blocked_by_safety') ||
@@ -721,31 +832,114 @@ export function classifyError(err: unknown): GeminiError {
     lower.includes('harm_category') ||
     (lower.includes('safety') && lower.includes('ratings'))
   ) {
-    return new GeminiError('policy_blocked', msg)
+    return new GeminiError('policy_blocked', msg, undefined, { httpStatus, googleStatus, quotaId, quotaValue })
   }
 
-  // All other 429s, resource_exhausted, quota exceeded, per-minute, TPM, RPM, pacing are TEMPORARY rate limits
+  // 3. 404/no longer available
+  if (
+    lower.includes('no longer available') ||
+    (httpStatus === 404 && (lower.includes('not found') || lower.includes('models/'))) ||
+    (lower.includes('404') && (lower.includes('not found') || lower.includes('models/')))
+  ) {
+    return new GeminiError('unavailable', msg, undefined, { httpStatus, googleStatus, quotaId, quotaValue })
+  }
+
+  // 4. HTTP 503/500/502/504 or status UNAVAILABLE/INTERNAL or "high demand"/"overloaded"/"service unavailable" => 'overloaded' (NOT 'rate')
+  const isOverloaded =
+    httpStatus === 503 ||
+    httpStatus === 500 ||
+    httpStatus === 502 ||
+    httpStatus === 504 ||
+    googleStatus === 'UNAVAILABLE' ||
+    googleStatus === 'INTERNAL' ||
+    lower.includes('503') ||
+    lower.includes('502') ||
+    lower.includes('504') ||
+    lower.includes('high demand') ||
+    lower.includes('overloaded') ||
+    lower.includes('service unavailable') ||
+    lower.includes('temporarily unavailable') ||
+    lower.includes('fetch failed')
+
+  if (isOverloaded) {
+    const errorStatus = httpStatus || 503
+    const finalErr = new GeminiError('overloaded', msg, googleRetryDelayMs ?? undefined, {
+      httpStatus: errorStatus,
+      googleStatus: googleStatus || 'UNAVAILABLE',
+      quotaId,
+      quotaValue,
+    })
+    logGeminiRawError({
+      time: Date.now(),
+      keyIdx: ctx?.keyIdx || 0,
+      model: ctx?.model || 'unknown',
+      requestKind: ctx?.requestKind || 'unknown',
+      httpStatus: errorStatus,
+      quotaId,
+      quotaValue,
+      rawSnippet: msg.slice(0, 400),
+    })
+    return finalErr
+  }
+
+  // 5. HTTP 429/RESOURCE_EXHAUSTED
   const is429 =
-    lower.includes('429') ||
+    httpStatus === 429 ||
+    googleStatus === 'RESOURCE_EXHAUSTED' ||
     lower.includes('resource_exhausted') ||
-    lower.includes('resource has been exhausted') ||
-    lower.includes('quota') ||
-    lower.includes('rate limit') ||
-    lower.includes('limit:') ||
-    lower.includes('exhausted') ||
-    lower.includes('per minute') ||
-    lower.includes('rpm') ||
-    lower.includes('tpm')
+    lower.includes('429')
 
   if (is429) {
-    return new GeminiError('rate', msg, googleRetryDelayMs ?? undefined)
+    const qIdLower = (quotaId || '').toLowerCase()
+    const qVal = (quotaValue || '').trim()
+
+    let kind: GeminiErrorKind = 'rate'
+
+    if (qVal === '0' || lower.includes('limit: 0') || lower.includes('limit:0')) {
+      kind = 'model_unavailable'
+    } else if (
+      qIdLower.includes('perminute') ||
+      qIdLower.includes('per_minute')
+    ) {
+      kind = 'rate'
+    } else if (
+      (qIdLower.includes('perday') || qIdLower.includes('per_day')) &&
+      !qIdLower.includes('perminute') &&
+      !qIdLower.includes('per_minute')
+    ) {
+      kind = 'rpd'
+    } else {
+      kind = 'rate'
+    }
+
+    const finalErr = new GeminiError(kind, msg, googleRetryDelayMs ?? undefined, {
+      httpStatus: httpStatus || 429,
+      googleStatus: googleStatus || 'RESOURCE_EXHAUSTED',
+      quotaId,
+      quotaValue,
+    })
+
+    logGeminiRawError({
+      time: Date.now(),
+      keyIdx: ctx?.keyIdx || 0,
+      model: ctx?.model || 'unknown',
+      requestKind: ctx?.requestKind || 'unknown',
+      httpStatus: httpStatus || 429,
+      quotaId,
+      quotaValue,
+      rawSnippet: msg.slice(0, 400),
+    })
+
+    return finalErr
   }
 
+  // 6. empty response
   if (lower.includes('empty') && (lower.includes('response') || lower.includes('finder') || lower.includes('model'))) {
-    return new GeminiError('empty', msg)
+    return new GeminiError('empty', msg, undefined, { httpStatus, googleStatus, quotaId, quotaValue })
   }
 
-  return new GeminiError('other', msg, googleRetryDelayMs ?? undefined)
+  // 7. other
+  return new GeminiError('other', msg, googleRetryDelayMs ?? undefined, { httpStatus, googleStatus, quotaId, quotaValue })
 }
 
 /** The ONE prompt sent for EVERY movie chunk (word-for-word from data/experiment-prompt.md). */
@@ -1433,15 +1627,20 @@ function parseFinderGeneric(
   return out
 }
 
+export interface MapChunkResult {
+  text: string
+  promptTokenCount?: number
+}
+
 /** One chunk-map request: whole short video + one movie chunk, the SAME prompt every time.
- * Returns the raw model text (HISSA 1 + HISSA 2) — parsing happens separately. */
+ * Returns the raw model text (HISSA 1 + HISSA 2) along with usageMetadata — parsing happens separately. */
 export async function mapChunkRequest(
   ai: GoogleGenAI,
   model: string,
   shortUri: string,
   chunkUri: string,
   customPrompt?: string,
-): Promise<string> {
+): Promise<MapChunkResult> {
   try {
     const resp = await ai.models.generateContent({
       model,
@@ -1458,9 +1657,13 @@ export async function mapChunkRequest(
       config: GEN_CONFIG,
     })
     const details = extractResponseDetails(resp)
-    return checkResponseText(details, 'model')
+    const text = checkResponseText(details, 'model')
+    return {
+      text,
+      promptTokenCount: details.usageMetadata?.promptTokenCount,
+    }
   } catch (err) {
-    throw classifyError(err)
+    throw classifyError(err, { model, requestKind: 'chunk_map' })
   }
 }
 
