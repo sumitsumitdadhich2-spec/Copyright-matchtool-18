@@ -555,6 +555,7 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
                 selected.rpd || 20,
                 re.kind === 'rpd',
                 effectiveCooldownMs,
+                selected.keyIdx,
               )
               const googleNote = googleDelayMs ? ` (Google requested ${(googleDelayMs / 1000).toFixed(1)}s + 5s buffer)` : ''
               addLog(

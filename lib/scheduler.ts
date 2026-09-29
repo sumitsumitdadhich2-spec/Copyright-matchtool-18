@@ -1832,18 +1832,22 @@ class Scheduler {
       } catch (err) {
         const e = err instanceof GeminiError ? err : classifyError(err)
         if (e.kind === 'rate' || e.kind === 'rpd') {
+          const googleDelayMs = extractGoogleRetryDelayMs(err) ?? e.retryDelayMs
+          const { effectiveCooldownMs } = calculateEffectiveCooldownMs(googleDelayMs, isVerify ? RATE_COOLDOWN_MS : CHUNK_COOLDOWN_MS)
           const outcome = globalGeminiCoordinator.handleQuotaOrRateError(
             lane.apiKey,
             m.id,
             slot,
             m.rpd || 20,
             e.kind === 'rpd',
+            effectiveCooldownMs,
+            lane.idx,
           )
           if (outcome.action === 'exhausted') {
             setModelExhausted(m.id, lane.apiKey)
             st.state = 'exhausted'
           } else {
-            job.cooldownUntil[pk] = Date.now() + CHUNK_COOLDOWN_MS
+            job.cooldownUntil[pk] = Date.now() + effectiveCooldownMs
             st.state = 'cooling'
           }
         }
@@ -2260,7 +2264,7 @@ class Scheduler {
 
                 // 429 Rate limit on this (key × model): Lock this model for Google delay + 5s buffer and switch immediately to another free lane!
                 release(0, effectiveCooldownMs)
-                globalGeminiCoordinator.handleQuotaOrRateError(chosenLane.apiKey, chosenRm.id, 0, chosenRm.rpd || 500, false, effectiveCooldownMs)
+                globalGeminiCoordinator.handleQuotaOrRateError(chosenLane.apiKey, chosenRm.id, 0, chosenRm.rpd || 500, false, effectiveCooldownMs, chosenLane.idx)
                 const googleNote = googleDelayMs ? ` (Google requested ${(googleDelayMs / 1000).toFixed(1)}s + 5s buffer)` : ''
                 addLog(
                   scan,

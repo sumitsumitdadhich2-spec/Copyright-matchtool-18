@@ -918,12 +918,12 @@ class GlobalGeminiCoordinator {
   }
 
   /**
-   * Smart Quota/Rate Limit handler according to user rules:
+   * Smart Quota/Rate Limit handler:
    * 1. Never disable the entire API key! Only isolate this specific model on this key.
-   * 2. Do not immediately believe a first "quota error" / 429 as permanent daily quota exhaustion.
-   * 3. Apply exact Google delay + 5s buffer lock on that model and allow a retry.
-   * 4. Only if it fails AGAIN after cooldown (consecutive >= 2) OR if actual usedToday >= rpdCap,
-   *    mark this model as daily exhausted for today.
+   * 2. Temporary rate limit spikes (429 RPM/TPM) or server high demand (503) are NEVER daily exhausted!
+   *    They are put in cooldown for the exact Google delay + 5s buffer lock, and retried.
+   * 3. Only mark as daily exhausted if actual usedToday >= rpdCap OR if Google sends an explicit daily quota error
+   *    and usage is near/at the cap.
    */
   public handleQuotaOrRateError(
     apiKey: string,
@@ -932,19 +932,23 @@ class GlobalGeminiCoordinator {
     rpdCap: number = 20,
     isExplicitDailyMsg: boolean = false,
     cooldownMsOverride?: number,
+    keyIdx?: number,
   ): {
     action: 'cooldown' | 'exhausted'
     waitSec: number
     reason: string
   } {
     this.checkDayRollover()
-    const lane = this.getOrCreateLane(apiKey, modelId, slot)
+    const lane = this.getOrCreateLane(apiKey, modelId, slot, keyIdx ?? 1)
+    if (keyIdx !== undefined && keyIdx > 0) {
+      lane.keyIdx = keyIdx
+    }
     const used = getModelUsage(modelId, apiKey)
     const effectiveCooldownMs = cooldownMsOverride !== undefined && cooldownMsOverride > 0
       ? cooldownMsOverride
       : CHUNK_COOLDOWN_MS
 
-    // If actual recorded usage has reached or exceeded the daily cap, it is definitively exhausted
+    // 1. If actual recorded usage has reached or exceeded the daily cap, it is genuinely exhausted
     if (used >= rpdCap) {
       this.reportExhausted(apiKey, modelId, slot, rpdCap)
       return {
@@ -954,37 +958,27 @@ class GlobalGeminiCoordinator {
       }
     }
 
-    lane.consecutiveQuotaErrors = (lane.consecutiveQuotaErrors || 0) + 1
-
-    // If it's the 1st quota error, or usage is well below cap (< rpdCap):
-    // Put ONLY this model in cooldown (Google delay + 5s buffer) and give it a chance to retry!
-    if (lane.consecutiveQuotaErrors < 2 && !isExplicitDailyMsg) {
-      this.reportRateLimit(apiKey, modelId, effectiveCooldownMs, slot)
-      const waitSec = Math.ceil(effectiveCooldownMs / 1000)
-      return {
-        action: 'cooldown',
-        waitSec,
-        reason: `Rate/quota spike on ${modelId} (Key ${lane.keyIdx}, used ${used}/${rpdCap} RPD) — locked for ${waitSec}s (+5s buffer) before retry`,
-      }
-    }
-
-    // If it is explicitly a daily limit error AND consecutive error count >= 2, or used >= rpdCap
-    if (lane.consecutiveQuotaErrors >= 2 || (isExplicitDailyMsg && used >= Math.max(5, rpdCap - 2))) {
+    // 2. If it is explicitly a daily limit error from Google and usage is near cap:
+    if (isExplicitDailyMsg && (used >= Math.max(1, rpdCap - 2) || (lane.consecutiveQuotaErrors || 0) >= 3)) {
       this.reportExhausted(apiKey, modelId, slot, rpdCap)
       return {
         action: 'exhausted',
         waitSec: 0,
-        reason: `Daily quota confirmed exhausted on ${modelId} (Key ${lane.keyIdx}) after cooldown & retry (${used}/${rpdCap} RPD)`,
+        reason: `Daily quota confirmed exhausted on ${modelId} (Key ${lane.keyIdx}) (${used}/${rpdCap} RPD)`,
       }
     }
 
-    // Fallback: temporary cooldown
+    // 3. For ALL other rate limits (429 RPM/TPM) and server spikes (503 high demand):
+    // Put ONLY this model in cooldown (Google delay + 5s buffer lock) and retry after lock expires!
+    lane.consecutiveQuotaErrors = (lane.consecutiveQuotaErrors || 0) + 1
+    lane.isExhausted = false
     this.reportRateLimit(apiKey, modelId, effectiveCooldownMs, slot)
-    const fallbackWaitSec = Math.ceil(effectiveCooldownMs / 1000)
+    const waitSec = Math.ceil(effectiveCooldownMs / 1000)
+
     return {
       action: 'cooldown',
-      waitSec: fallbackWaitSec,
-      reason: `Temporary rate limit on ${modelId} (Key ${lane.keyIdx}) — locked for ${fallbackWaitSec}s before retry`,
+      waitSec,
+      reason: `Rate/quota spike on ${modelId} (Key ${lane.keyIdx}, used ${used}/${rpdCap} RPD) — locked for ${waitSec}s (+5s buffer) before retry`,
     }
   }
 

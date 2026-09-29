@@ -325,6 +325,7 @@ export async function verifySingleMinute(
             chosenLane.rpd || 20,
             geminiErr.kind === 'rpd',
             effectiveCooldownMs,
+            chosenLane.keyIdx,
           )
 
           const googleNote = googleDelayMs ? ` (Google requested ${(googleDelayMs / 1000).toFixed(1)}s + 5s buffer = ${(effectiveCooldownMs / 1000).toFixed(1)}s lock)` : ''
