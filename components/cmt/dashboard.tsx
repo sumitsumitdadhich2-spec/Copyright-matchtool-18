@@ -2,13 +2,30 @@
 
 import { useState } from 'react'
 import useSWR from 'swr'
-import { Play, Square, RotateCcw, Loader2, LogOut, ScanSearch, Settings, Users, ShieldCheck, ShieldX, Zap, ZapOff } from 'lucide-react'
+import {
+  Play,
+  Square,
+  RotateCcw,
+  Loader2,
+  LogOut,
+  ScanSearch,
+  Settings,
+  Users,
+  ShieldCheck,
+  ShieldX,
+  Zap,
+  ZapOff,
+  FileDown,
+  CheckCircle2,
+  AlertTriangle,
+} from 'lucide-react'
 import type { Scan, MinuteFinderMode } from '@/lib/types'
 import { fetcher } from '@/lib/format'
 import { useAuth } from '@/components/auth/auth-gate'
 import { UsersDialog } from '@/components/auth/users-dialog'
 import { TokenBadge, TokensExhaustedBanner, useTokens } from './token-badge'
 import { SettingsDialog } from './settings-dialog'
+import { downloadScanLogsPdf } from '@/lib/pdf-export'
 import { UploadPanel } from './upload-panel'
 import { TwelveLabsPanel } from './twelvelabs-panel'
 import { MinuteFinderPanel } from './minute-finder-panel'
@@ -174,6 +191,20 @@ export function Dashboard() {
     refreshTokens()
   }
 
+  const [downloadingLogsPdf, setDownloadingLogsPdf] = useState(false)
+
+  async function handleDownloadLogsPdf() {
+    if (!scan || (scan.logs?.length ?? 0) === 0) return
+    setDownloadingLogsPdf(true)
+    try {
+      await downloadScanLogsPdf(scan, { allLogs: true })
+    } catch (err) {
+      console.error('Error exporting scan logs PDF:', err)
+    } finally {
+      setDownloadingLogsPdf(false)
+    }
+  }
+
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-4 p-4 md:p-6">
       <TopMilestoneBanner scan={scan} onSelectScan={setScanId} />
@@ -317,6 +348,25 @@ export function Dashboard() {
           >
             <Square className="size-4" aria-hidden /> Stop
           </button>
+          {scan && (scan.logs?.length ?? 0) > 0 && (
+            <button
+              type="button"
+              onClick={handleDownloadLogsPdf}
+              disabled={downloadingLogsPdf}
+              title={`Download all ${scan.logs.length} scan logs as a formatted PDF`}
+              className="btn-press flex items-center gap-1.5 rounded-lg border border-primary/40 bg-primary/10 px-3 py-2 text-sm font-semibold text-primary hover:bg-primary/20 transition-all shadow-sm"
+            >
+              {downloadingLogsPdf ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <FileDown className="size-4" />
+              )}
+              <span className="hidden sm:inline">Logs PDF</span>
+              <span className="rounded-full bg-primary/20 px-1.5 py-0.5 text-[10px] font-mono">
+                {scan.logs.length}
+              </span>
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setSettingsOpen(true)}
@@ -356,6 +406,64 @@ export function Dashboard() {
       {user.role === 'admin' && <UsersDialog open={usersOpen} onClose={() => setUsersOpen(false)} />}
 
       {scanBlocked && <TokensExhaustedBanner tokens={tokens} />}
+
+      {scan && status === 'stopped' && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3.5 text-amber-200 shadow-md">
+          <div className="flex items-center gap-2.5">
+            <AlertTriangle className="size-5 shrink-0 text-amber-400" />
+            <div>
+              <p className="text-sm font-semibold text-amber-200">Scan is currently Stopped</p>
+              <p className="text-xs text-amber-300/80">
+                All partial logs ({scan.logs?.length || 0} events) and verified matches are preserved. You can download the complete logs PDF now or click Resume to continue scanning anytime.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleDownloadLogsPdf}
+              disabled={downloadingLogsPdf || (scan.logs?.length ?? 0) === 0}
+              className="btn-press flex items-center gap-1.5 rounded-lg bg-amber-500 text-amber-950 font-bold px-3.5 py-1.5 text-xs hover:bg-amber-400 transition-all shadow-sm"
+            >
+              {downloadingLogsPdf ? <Loader2 className="size-3.5 animate-spin" /> : <FileDown className="size-3.5" />}
+              Download Logs PDF ({scan.logs?.length || 0} logs)
+            </button>
+            {canResume && (
+              <button
+                type="button"
+                onClick={() => action('start', { resume: true })}
+                disabled={busy}
+                className="btn-press flex items-center gap-1 rounded-lg border border-amber-400/40 bg-amber-400/15 px-3 py-1.5 text-xs font-semibold text-amber-200 hover:bg-amber-400/25"
+              >
+                <RotateCcw className="size-3.5" /> Resume Scan
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {scan && status === 'completed' && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-3.5 text-emerald-200 shadow-md">
+          <div className="flex items-center gap-2.5">
+            <CheckCircle2 className="size-5 shrink-0 text-emerald-400" />
+            <div>
+              <p className="text-sm font-semibold text-emerald-200">Scan Completed Successfully!</p>
+              <p className="text-xs text-emerald-300/80">
+                All candidate verification and rescans finished ({scan.candidateGroups?.filter((g) => g.status === 'confirmed').length || 0} confirmed matches). Download complete session diagnostic logs.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleDownloadLogsPdf}
+            disabled={downloadingLogsPdf || (scan.logs?.length ?? 0) === 0}
+            className="btn-press flex items-center gap-1.5 rounded-lg bg-emerald-500 text-emerald-950 font-bold px-3.5 py-1.5 text-xs hover:bg-emerald-400 transition-all shadow-sm"
+          >
+            {downloadingLogsPdf ? <Loader2 className="size-3.5 animate-spin" /> : <FileDown className="size-3.5" />}
+            Download Logs PDF ({scan.logs?.length || 0} logs)
+          </button>
+        </div>
+      )}
 
       {actionError && (
         <p role="alert" className="alert-in rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">

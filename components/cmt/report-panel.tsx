@@ -15,6 +15,7 @@ import {
   Search,
   Eye,
   Layers,
+  FileDown,
 } from 'lucide-react'
 import type { Scan, ChunkMatch, CandidateGroup, CandidateEntry } from '@/lib/types'
 import { fmtTime, fmtDuration } from '@/lib/format'
@@ -22,11 +23,25 @@ import { displayModelName } from '@/lib/models'
 import { originLabel, isRejectedKept } from '@/lib/candidate-pick'
 import { ScanUsageReport } from './scan-usage-report'
 import { ScanTimingReport } from './scan-timing-report'
+import { downloadScanLogsPdf } from '@/lib/pdf-export'
 
 export function ReportPanel({ scan }: { scan: Scan }) {
   const [expandedMatchKey, setExpandedMatchKey] = useState<string | null>(null)
   const [filterMode, setFilterMode] = useState<'all' | 'confirmed' | 'rejected' | 'rescan' | 'verifying'>('all')
   const [searchQuery, setSearchQuery] = useState('')
+  const [downloadingPdf, setDownloadingPdf] = useState(false)
+
+  const handleDownloadLogsPdf = async () => {
+    if (!scan || (scan.logs?.length ?? 0) === 0) return
+    setDownloadingPdf(true)
+    try {
+      await downloadScanLogsPdf(scan, { allLogs: true })
+    } catch (err) {
+      console.error('Failed to export PDF:', err)
+    } finally {
+      setDownloadingPdf(false)
+    }
+  }
 
   const report = scan.report
   const matches = useMemo(() => {
@@ -249,21 +264,35 @@ export function ReportPanel({ scan }: { scan: Scan }) {
             INCOMPLETE — {chunksPending} chunk(s) not scanned · {groupsPending} group(s) unfinished
           </span>
         )}
-        {report.prefilterMode != null && (
-          <span
-            className={`ml-auto rounded-full px-2.5 py-0.5 text-xs font-medium ${
-              report.prefilterMode === 'twelvelabs' || report.prefilterMode === 'gemini'
-                ? 'bg-primary/15 text-primary border border-primary/30'
-                : 'bg-secondary text-muted-foreground'
-            }`}
-          >
-            {report.prefilterMode === 'twelvelabs'
-              ? `Twelve Labs pre-filtered — ${report.prefilterSelected ?? 0} of ${report.prefilterTotal ?? 0} chunks`
-              : report.prefilterMode === 'gemini'
-                ? `Chunk set: Gemini Minute Finder (${scan.geminiPrescan?.appliedMinutes?.length ?? 0} minutes)`
-                : 'Full scan'}
-          </span>
-        )}
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          {scan && (scan.logs?.length ?? 0) > 0 && (
+            <button
+              type="button"
+              onClick={handleDownloadLogsPdf}
+              disabled={downloadingPdf}
+              title={`Download all ${scan.logs.length} scan logs as a formatted PDF`}
+              className="btn-press flex items-center gap-1.5 rounded-lg border border-primary/40 bg-primary/10 px-2.5 py-1 text-xs font-semibold text-primary hover:bg-primary/20 transition-all shadow-sm"
+            >
+              {downloadingPdf ? <Loader2 className="size-3 animate-spin" /> : <FileDown className="size-3" />}
+              <span>Logs PDF ({scan.logs.length})</span>
+            </button>
+          )}
+          {report.prefilterMode != null && (
+            <span
+              className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${
+                report.prefilterMode === 'twelvelabs' || report.prefilterMode === 'gemini'
+                  ? 'bg-primary/15 text-primary border border-primary/30'
+                  : 'bg-secondary text-muted-foreground'
+              }`}
+            >
+              {report.prefilterMode === 'twelvelabs'
+                ? `Twelve Labs pre-filtered — ${report.prefilterSelected ?? 0} of ${report.prefilterTotal ?? 0} chunks`
+                : report.prefilterMode === 'gemini'
+                  ? `Chunk set: Gemini Minute Finder (${scan.geminiPrescan?.appliedMinutes?.length ?? 0} minutes)`
+                  : 'Full scan'}
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Top summary stats */}

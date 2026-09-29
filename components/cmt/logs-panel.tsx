@@ -15,9 +15,12 @@ import {
   Layers,
   X,
   Radio,
+  FileDown,
+  Loader2,
 } from 'lucide-react'
 import type { Scan, LogEntry } from '@/lib/types'
 import { EngineBadge } from './engine-badge'
+import { downloadScanLogsPdf } from '@/lib/pdf-export'
 
 type LogCategory = 'all' | 'batch' | 'render' | 'rescan' | 'scan' | 'alerts'
 
@@ -251,6 +254,8 @@ export function LogsPanel({ scan }: { scan: Scan }) {
     }
   }, [scan])
 
+  const [downloadingPdf, setDownloadingPdf] = useState(false)
+
   const handleCopyLogs = async () => {
     const text = filteredLogs
       .map(
@@ -261,6 +266,22 @@ export function LogsPanel({ scan }: { scan: Scan }) {
     await navigator.clipboard.writeText(text).catch(() => {})
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
+  }
+
+  const handleDownloadPdf = async (allLogs: boolean = true) => {
+    if (logs.length === 0) return
+    setDownloadingPdf(true)
+    try {
+      await downloadScanLogsPdf(scan, {
+        allLogs,
+        logsToExport: allLogs ? logs : filteredLogs,
+        label: allLogs ? undefined : category !== 'all' ? `${category.toUpperCase()} FILTER` : undefined,
+      })
+    } catch (err) {
+      console.error('Failed to generate scan logs PDF:', err)
+    } finally {
+      setDownloadingPdf(false)
+    }
   }
 
   return (
@@ -281,10 +302,40 @@ export function LogsPanel({ scan }: { scan: Scan }) {
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <EngineBadge
             live={scan.status === 'scanning' || scan.status === 'chunking' || scan.renderJob?.status === 'rendering'}
           />
+
+          {/* Download Logs as PDF Button */}
+          <button
+            type="button"
+            onClick={() => handleDownloadPdf(true)}
+            disabled={logs.length === 0 || downloadingPdf}
+            title="Download ALL scan logs as a formatted PDF report"
+            className="btn-press flex items-center gap-1.5 rounded-md border border-primary/40 bg-primary/15 px-2.5 py-1 text-[11px] font-semibold text-primary hover:bg-primary/25 disabled:opacity-50 transition-all shadow-sm"
+          >
+            {downloadingPdf ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : (
+              <FileDown className="size-3" />
+            )}
+            <span>Download PDF (All {logs.length})</span>
+          </button>
+
+          {/* If a category filter is active, also offer filtered PDF */}
+          {category !== 'all' && filteredLogs.length !== logs.length && (
+            <button
+              type="button"
+              onClick={() => handleDownloadPdf(false)}
+              disabled={filteredLogs.length === 0 || downloadingPdf}
+              title={`Download only ${category} logs (${filteredLogs.length} events) as PDF`}
+              className="btn-press flex items-center gap-1 rounded-md border border-border bg-secondary px-2 py-1 text-[11px] font-medium text-muted-foreground hover:text-foreground disabled:opacity-50 transition-colors"
+            >
+              <FileDown className="size-3" />
+              <span>PDF ({category}: {filteredLogs.length})</span>
+            </button>
+          )}
 
           {/* Auto-scroll toggle */}
           <button
