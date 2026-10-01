@@ -7,6 +7,7 @@ import {
   isModelDailyQuotaExhausted,
   geminiUsageDay,
   checkDailyReset,
+  cleanseStartupQuotas,
 } from './store'
 import { pacingIntervalMs, RATE_COOLDOWN_MS, CHUNK_COOLDOWN_MS, displayModelName } from './models'
 
@@ -148,14 +149,16 @@ class GlobalGeminiCoordinator {
    */
   public isModelExhausted(apiKey: string, modelId: string, rpdCap: number = 500): boolean {
     this.checkDayRollover()
+    const used = getModelUsage(modelId, apiKey)
     const lane = this.getOrCreateLane(apiKey, modelId, 0)
-    const exhaustedInStore = isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)
-    if (!exhaustedInStore) {
+    // FINAL DECISION: Setting quota is the sole authority for daily exhaustion!
+    if (used < rpdCap) {
       lane.isExhausted = false
       return false
     }
-    lane.isExhausted = true
-    return true
+    const exhaustedInStore = isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)
+    lane.isExhausted = exhaustedInStore
+    return exhaustedInStore
   }
 
   private getLaneKey(apiKey: string, modelId: string, slot: number = 0): string {
@@ -205,8 +208,12 @@ class GlobalGeminiCoordinator {
     this.checkDayRollover()
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
     const now = Date.now()
+    const used = getModelUsage(modelId, apiKey)
 
-    if (lane.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
+    // FINAL DECISION: Only setting quota determines daily exhaustion!
+    if (used < rpdCap) {
+      lane.isExhausted = false
+    } else if (lane.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
       lane.isExhausted = true
       return {
         busy: true,
@@ -263,11 +270,16 @@ class GlobalGeminiCoordinator {
   public resetAllLanes(): void {
     for (const lane of this.lanes.values()) {
       lane.isExhausted = false
+      delete lane.firstRpdErrorAt
       lane.cooldownUntil = 0
       lane.nextFreeAt = 0
     }
     this.verifyModelStates.clear()
     this.chunkModelStates.clear()
+    this.exhaustedLogSet.clear()
+    try {
+      cleanseStartupQuotas()
+    } catch {}
     console.log('[Global Coordinator] All lane exhaustion, cooldown states, and verify/chunk batch states reset.')
   }
 
@@ -1088,61 +1100,41 @@ class GlobalGeminiCoordinator {
       console.log(`Google-wide ${this.activePauseClass} event, pausing ${pauseMin} min`)
     }
 
-    // 1. If actual recorded usage has reached or exceeded the daily cap, it is genuinely exhausted
+    // 1. FINAL DECISION: Only if actual recorded usage has reached or exceeded the setting quota cap is it exhausted!
     if (used >= rpdCap) {
       this.reportExhausted(apiKey, modelId, slot, rpdCap)
       return {
         action: 'exhausted',
         waitSec: 0,
-        reason: `Daily quota limit reached (${used}/${rpdCap} RPD) on ${modelId} (Key ${lane.keyIdx})`,
+        reason: `Daily setting quota limit reached (${used}/${rpdCap} RPD) on ${modelId} (Key ${lane.keyIdx || keyIdx || 1})`,
       }
     }
 
-    // 2. Mark exhausted ONLY if error.kind === 'rpd' from structured PerDay quotaId
-    // AND this lane had a previous 'rpd' error at least 10 minutes earlier
-    if (errKind === 'rpd') {
-      const now = Date.now()
-      if (lane.firstRpdErrorAt && now - lane.firstRpdErrorAt >= 10 * 60_000) {
-        this.reportExhausted(apiKey, modelId, slot, rpdCap)
-        return {
-          action: 'exhausted',
-          waitSec: 0,
-          reason: `Daily quota confirmed exhausted on ${modelId} (Key ${lane.keyIdx}) (${used}/${rpdCap} RPD)`,
-        }
-      } else {
-        if (!lane.firstRpdErrorAt) {
-          lane.firstRpdErrorAt = now
-        }
-        const cdMs = Math.max(cooldownMsOverride || 0, 10 * 60_000)
-        this.reportRateLimit(apiKey, modelId, cdMs, slot)
-        this.recordBreakerFailure(apiKey, modelId, 'rpd', used, rpdCap)
-        const waitSec = Math.ceil(cdMs / 1000)
-        return {
-          action: 'cooldown',
-          waitSec,
-          reason: `First RPD error on ${modelId} (Key ${lane.keyIdx}, used ${used}/${rpdCap} RPD) — setting 10 min cooldown probe before marking exhausted`,
-        }
-      }
-    }
-
-    // 3. For ALL other rate limits (429 RPM/TPM) and server spikes (503 overloaded):
-    // 'overloaded' and 'rate' must never increment consecutiveQuotaErrors toward exhaustion!
+    // 2. If used < rpdCap, this is strictly a temporary rate/quota spike (429 / RPM / TPM / 503).
+    // The final exhaustion decision belongs ONLY to the setting quota (used >= rpdCap).
+    // NEVER mark daily exhausted when recorded usage is below the setting quota!
     lane.isExhausted = false
+    delete lane.firstRpdErrorAt
     const failureClass: 'rate' | 'overloaded' = errKind === 'overloaded' ? 'overloaded' : 'rate'
     this.reportRateLimit(apiKey, modelId, effectiveCooldownMs, slot)
     this.recordBreakerFailure(apiKey, modelId, failureClass, used, rpdCap)
     const waitSec = Math.ceil(effectiveCooldownMs / 1000)
 
-    const label = failureClass === 'overloaded' ? '503 overloaded' : 'Rate/quota spike'
+    const label = failureClass === 'overloaded' ? '503 overloaded' : 'Rate/RPM/TPM limit spike'
     return {
       action: 'cooldown',
       waitSec,
-      reason: `${label} on ${modelId} (Key ${lane.keyIdx}, used ${used}/${rpdCap} RPD) — locked for ${waitSec}s (+5s buffer) before retry`,
+      reason: `${label} on ${modelId} (Key ${lane.keyIdx || keyIdx || 1}, used ${used}/${rpdCap} RPD) — locked for ${waitSec}s (+5s buffer) before retry`,
     }
   }
 
   /** Report that a model's daily quota has been exhausted across the entire app */
   public reportExhausted(apiKey: string, modelId: string, slot: number = 0, rpdCap: number = 20) {
+    const used = getModelUsage(modelId, apiKey)
+    if (used < rpdCap) {
+      console.warn(`[Global Coordinator] Ignored reportExhausted for Key ${slot} (${modelId}) because recorded usage (${used}) has not reached setting quota (${rpdCap} RPD).`)
+      return
+    }
     const kh = apiKeyHash(apiKey)
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
     lane.isExhausted = true
@@ -1155,7 +1147,7 @@ class GlobalGeminiCoordinator {
         while (other.waiters.length > 0) {
           const waiter = other.waiters.shift()
           if (waiter) {
-            waiter.reject(new Error(`[Global Coordinator] Key ${other.keyIdx} (${modelId}) daily quota (${rpdCap} RPD) exhausted`))
+            waiter.reject(new Error(`[Global Coordinator] Key ${other.keyIdx} (${modelId}) daily setting quota (${rpdCap} RPD) reached`))
           }
         }
       }
@@ -1165,12 +1157,12 @@ class GlobalGeminiCoordinator {
     const logKey = `${day}|${kh}|${modelId}`
     if (!this.exhaustedLogSet.has(logKey)) {
       this.exhaustedLogSet.add(logKey)
-      console.log(`[Global Coordinator] Key ${lane.keyIdx} (${modelId}) daily quota (${rpdCap} RPD) exhausted for today (${day}).`)
+      console.log(`[Global Coordinator] Key ${lane.keyIdx} (${modelId}) daily setting quota (${rpdCap} RPD) reached for today (${day}).`)
     }
 
     // Persist to counters.json so subsequent workers/processes know this model is quota-capped today
     try {
-      setModelExhausted(modelId, apiKey)
+      setModelExhausted(modelId, apiKey, rpdCap)
     } catch {}
   }
 

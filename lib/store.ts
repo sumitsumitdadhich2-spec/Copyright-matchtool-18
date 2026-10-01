@@ -176,33 +176,27 @@ export function getModelUsage(model: string, apiKey: string): number {
 
 export function isModelDailyQuotaExhausted(model: string, apiKey: string, rpdCap: number = 20): boolean {
   checkDailyReset()
-  const counters = getCachedCounters()
   const usage = getModelUsage(model, apiKey)
-  const exhVal = counters[exhaustedKey(model, apiKey)]
-  if (exhVal !== undefined && exhVal !== null) {
-    let exhAt = 0
-    if (typeof exhVal === 'object' && exhVal !== null && 'at' in exhVal) {
-      exhAt = Number((exhVal as { at: number }).at) || 0
-    } else if (typeof exhVal === 'number') {
-      exhAt = exhVal
-    }
-    const now = Date.now()
-    if (exhAt > 0 && now - exhAt > 45 * 60_000) {
-      // Expired after 45 minutes — delete flag to allow ONE probe request
-      delete counters[exhaustedKey(model, apiKey)]
+  // FINAL DECISION: Only setting quota determines daily exhaustion!
+  if (usage < rpdCap) {
+    // If usage is below setting quota, it is NEVER exhausted!
+    // Clean up any false/stale _exh flag in counters
+    const counters = getCachedCounters()
+    const exhK = exhaustedKey(model, apiKey)
+    if (counters[exhK] !== undefined) {
+      delete counters[exhK]
       saveCounters(counters)
-      return false
     }
-    // Flag exists and is not expired: return true. Do NOT delete because usage < rpdCap!
-    return true
+    return false
   }
-  return usage >= rpdCap
+  return true
 }
 
 export function getModelExhausted(model: string, apiKey: string): boolean {
   checkDailyReset()
-  const counters = getCachedCounters()
-  return Boolean(counters[exhaustedKey(model, apiKey)])
+  const modelSpec = MODEL_POOL.find((m) => m.id === model)
+  const rpdCap = modelSpec?.rpd || 20
+  return isModelDailyQuotaExhausted(model, apiKey, rpdCap)
 }
 
 export function incrementModelUsage(model: string, apiKey: string): number {
@@ -233,10 +227,14 @@ export function decrementModelUsage(model: string, apiKey: string): number {
   return (counters[key] as number) || 0
 }
 
-export function setModelExhausted(model: string, apiKey: string) {
+export function setModelExhausted(model: string, apiKey: string, rpdCap: number = 20) {
   checkDailyReset()
+  const usage = getModelUsage(model, apiKey)
+  // FINAL DECISION: Only persist exhausted flag if setting quota is actually reached!
+  if (usage < rpdCap) {
+    return
+  }
   const counters = getCachedCounters()
-  // Save flag value as {at: timestamp}
   counters[exhaustedKey(model, apiKey)] = { at: Date.now() }
   saveCounters(counters)
 }
@@ -258,19 +256,86 @@ export function clearAllExhaustedFlags(): void {
 }
 
 /**
+ * Comprehensive startup quota validator:
+ * Checks all existing counters on disk against MODEL_POOL setting quotas (rpd).
+ * If any model was falsely marked exhausted (_exh) but usage < rpdCap, removes the flag immediately.
+ */
+export function cleanseStartupQuotas(): { checked: number; cleared: number; remainingExhausted: number } {
+  ensureDirs()
+  checkDailyReset()
+  const counters = getCachedCounters()
+  const today = todayKey()
+  let checked = 0
+  let cleared = 0
+  let remainingExhausted = 0
+
+  for (const k of Object.keys(counters)) {
+    if (k.startsWith('_exh|')) {
+      checked++
+      const parts = k.split('|')
+      // Format: _exh|model|day|keyHash
+      const modelId = parts[1]
+      const day = parts[2]
+      const keyHash = parts[3]
+
+      // If flag is from another day, delete immediately
+      if (day !== today) {
+        delete counters[k]
+        cleared++
+        continue
+      }
+
+      const modelSpec = MODEL_POOL.find((m) => m.id === modelId)
+      const rpdCap = modelSpec?.rpd || 20
+
+      const usageKey = `${modelId}|${day}|${keyHash}`
+      const usage = typeof counters[usageKey] === 'number' ? (counters[usageKey] as number) : 0
+
+      if (usage < rpdCap) {
+        console.log(`[Startup Quota Check] Cleared false exhaustion flag for ${modelId} (usage: ${usage}/${rpdCap} RPD)`)
+        delete counters[k]
+        cleared++
+      } else {
+        remainingExhausted++
+      }
+    }
+  }
+
+  if (cleared > 0) {
+    saveCounters(counters)
+  }
+  return { checked, cleared, remainingExhausted }
+}
+
+/**
  * Reconciles today's counters directly from all recorded scans.
  * Ensures usage reflects ONLY genuine completed successful requests.
- * Deletes only flags from previous days; never deletes today's flags because usage < cap.
+ * Deletes flags from previous days and cleanses any false flags where usage < cap.
  */
 export function reconcileTodayCounters(): void {
   ensureDirs()
   const today = todayKey()
   const counters = getCachedCounters()
 
-  // Clean only flags from previous days; never delete today's flags because usage < cap
   for (const k of Object.keys(counters)) {
-    if (k.startsWith('_exh|') && !k.includes(`|${today}|`)) {
-      delete counters[k]
+    if (k.startsWith('_exh|')) {
+      const parts = k.split('|')
+      const modelId = parts[1]
+      const day = parts[2]
+      const keyHash = parts[3]
+
+      if (day !== today) {
+        delete counters[k]
+        continue
+      }
+
+      const modelSpec = MODEL_POOL.find((m) => m.id === modelId)
+      const rpdCap = modelSpec?.rpd || 20
+      const usageKey = `${modelId}|${day}|${keyHash}`
+      const usage = typeof counters[usageKey] === 'number' ? (counters[usageKey] as number) : 0
+      if (usage < rpdCap) {
+        delete counters[k]
+      }
     }
   }
 
@@ -501,3 +566,9 @@ export function addLog(scan: Scan, level: LogEntry['level'], msg: string) {
 
   scan.logs.push({ t: now, level, msg })
 }
+
+// Automatically check and cleanse any false exhaustion flags upon startup
+try {
+  cleanseStartupQuotas()
+} catch {}
+

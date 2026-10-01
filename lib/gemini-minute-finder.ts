@@ -1172,12 +1172,24 @@ async function laneWorker(
         queue.push(idx)
         log(id, 'error', `Key ${lane.keyIdx} is invalid or expired — all lanes for key ${lane.keyIdx} disabled for this scan; ${tag.toLowerCase()} #${w.index} re-queued`)
       } else if (e.kind === 'rpd') {
-        globalGeminiCoordinator.reportExhausted(lane.apiKey, lane.model.id, 0, lane.model.rpd)
-        setModelExhausted(lane.model.id, lane.apiKey, lane.model.rpd)
-        lane.dead = true
-        w.status = 'pending'
-        queue.push(idx)
-        log(id, 'warn', `Key ${lane.keyIdx} · ${lane.model.id}: model daily quota exhausted (${lane.model.rpd}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIdx}'s other models remain active; ${tag.toLowerCase()} #${w.index} re-queued`)
+        const used = getModelUsage(lane.model.id, lane.apiKey)
+        if (used >= lane.model.rpd) {
+          globalGeminiCoordinator.reportExhausted(lane.apiKey, lane.model.id, 0, lane.model.rpd)
+          setModelExhausted(lane.model.id, lane.apiKey, lane.model.rpd)
+          lane.dead = true
+          w.status = 'pending'
+          queue.push(idx)
+          log(id, 'warn', `Key ${lane.keyIdx} · ${lane.model.id}: model daily quota exhausted (${used}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIdx}'s other models remain active; ${tag.toLowerCase()} #${w.index} re-queued`)
+        } else {
+          const googleDelayMs = extractGoogleRetryDelayMs(err) ?? e.retryDelayMs
+          const { effectiveCooldownMs } = calculateEffectiveCooldownMs(googleDelayMs, 30_000)
+          globalGeminiCoordinator.reportRateLimit(lane.apiKey, lane.model.id, effectiveCooldownMs, 0)
+          ctrl.cooldownUntil[rk] = Date.now() + effectiveCooldownMs
+          w.status = 'pending'
+          queue.push(idx)
+          const googleNote = googleDelayMs ? ` (Google requested ${(googleDelayMs / 1000).toFixed(1)}s + 5s buffer)` : ''
+          log(id, 'warn', `${tag} #${w.index}: 429 rate limit on ${lane.label}${googleNote} (used ${used}/${lane.model.rpd} RPD) — ${(effectiveCooldownMs / 1000).toFixed(1)}s lock applied (other models on Key ${lane.keyIdx} remain active), re-queued: ${e.message.slice(0, 120)}`)
+        }
       } else if (e.kind === 'rate') {
         const googleDelayMs = extractGoogleRetryDelayMs(err) ?? e.retryDelayMs
         const { effectiveCooldownMs } = calculateEffectiveCooldownMs(googleDelayMs, 30_000)

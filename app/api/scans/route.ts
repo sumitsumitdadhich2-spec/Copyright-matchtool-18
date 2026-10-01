@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { listScans, newScan, saveScan, pruneOldScans, deleteScan, MAX_SCANS, SCANS_DIR } from '@/lib/store'
+import { listScans, newScan, saveScan, pruneOldScans, deleteScan, MAX_SCANS, SCANS_DIR, cleanseStartupQuotas } from '@/lib/store'
 import { restoreScans } from '@/lib/scan-store'
 import { getStorageUsage, invalidateUsageCache, STORAGE_LIMIT_BYTES } from '@/lib/media'
 import { getSession } from '@/lib/users'
@@ -12,6 +12,9 @@ import { getUserVerifierEnabled, getUserAutoMode } from '@/lib/user-keys'
 export const runtime = 'nodejs'
 
 export async function GET() {
+  try {
+    cleanseStartupQuotas()
+  } catch {}
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   await restoreScans(SCANS_DIR)

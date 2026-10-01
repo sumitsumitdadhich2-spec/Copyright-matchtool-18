@@ -27,6 +27,7 @@ import {
   geminiUsageDay,
   scanMediaDir,
   listScans,
+  cleanseStartupQuotas,
 } from './store'
 import { chunkPath, cleanupClips, extractClipPrecise, extractSegment, sanitizeVideoMute, segmentPath } from './ffmpeg'
 import { chunkOverlapsSegRange, segMovieRange, segHasMinuteList, formatMinuteList } from './segment-range'
@@ -335,7 +336,12 @@ class Scheduler {
       verifyActiveByModel: new Map(),
     }))
 
-    // Sync scan.keyLanes: ensure any exhausted model whose daily usage is under RPD is reset to idle
+    // Fast cleanse of any false exhaustion flags before starting
+    try {
+      cleanseStartupQuotas()
+    } catch {}
+
+    // Sync scan.keyLanes: ensure any model whose daily usage is under RPD is reset to idle
     if (!Array.isArray(scan.keyLanes)) scan.keyLanes = []
     for (const lane of lanes) {
       let laneState = scan.keyLanes.find((l) => l.idx === lane.idx)
@@ -1683,15 +1689,26 @@ class Scheduler {
           job.verifyQueue.push(gi)
           addLog(scan, 'error', `Verifier: API Key ${lane.idx} is invalid/expired — disabled for this scan; group ${g.id} re-queued for another key`)
         } else if (e.kind === 'rpd') {
-          globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, m.rpd)
-          setModelExhausted(m.id, lane.apiKey)
-          const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
-          if (laneState) {
-            const ms = laneState.models.find((item) => item.id === m.id)
-            if (ms) ms.state = 'exhausted'
+          const used = getModelUsage(m.id, lane.apiKey)
+          if (used >= m.rpd) {
+            globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, m.rpd)
+            setModelExhausted(m.id, lane.apiKey, m.rpd)
+            const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
+            if (laneState) {
+              const ms = laneState.models.find((item) => item.id === m.id)
+              if (ms) ms.state = 'exhausted'
+            }
+            job.verifyQueue.push(gi) // another (key × model) worker retries the same work
+            addLog(scan, 'warn', `Verifier: ${m.id} (key ${lane.idx}) model daily setting quota reached (${used}/${m.rpd} RPD) — group ${g.id} re-queued for another worker (key ${lane.idx}'s other models remain active)`)
+          } else {
+            const coolUntil = Date.now() + RATE_COOLDOWN_MS
+            job.cooldownUntil[this.rateKey(lane, m)] = coolUntil
+            globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, slot)
+            st.state = 'cooling'
+            st.cooldownUntil = coolUntil
+            job.verifyQueue.push(gi)
+            addLog(scan, 'warn', `Verifier: rate limit on ${displayModelName(m.id)} (key ${lane.idx}, used ${used}/${m.rpd} RPD) — group ${g.id} re-queued; model cooling for 1 min`)
           }
-          job.verifyQueue.push(gi) // another (key × model) worker retries the same work
-          addLog(scan, 'warn', `Verifier: ${m.id} (key ${lane.idx}) model daily quota exhausted (${m.rpd}/${m.rpd} RPD) — group ${g.id} re-queued for another worker (key ${lane.idx}'s other models remain active)`)
         } else if (e.kind === 'rate') {
           const coolUntil = Date.now() + RATE_COOLDOWN_MS
           job.cooldownUntil[this.rateKey(lane, m)] = coolUntil
@@ -1871,8 +1888,9 @@ class Scheduler {
             effectiveCooldownMs,
             lane.idx,
           )
-          if (outcome.action === 'exhausted') {
-            setModelExhausted(m.id, lane.apiKey)
+          const used = getModelUsage(m.id, lane.apiKey)
+          if (outcome.action === 'exhausted' && used >= (m.rpd || 20)) {
+            setModelExhausted(m.id, lane.apiKey, m.rpd)
             st.state = 'exhausted'
           } else {
             job.cooldownUntil[pk] = Date.now() + effectiveCooldownMs
@@ -3208,8 +3226,9 @@ class Scheduler {
             undefined,
             lane.idx,
           )
-          if (quotaOutcome.action === 'exhausted') {
-            setModelExhausted(m.id, lane.apiKey)
+          const used = getModelUsage(m.id, lane.apiKey)
+          if (quotaOutcome.action === 'exhausted' && used >= (m.rpd || 20)) {
+            setModelExhausted(m.id, lane.apiKey, m.rpd)
             const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
             if (laneState) {
               const ms = laneState.models.find((item) => item.id === m.id)
@@ -3217,7 +3236,8 @@ class Scheduler {
             }
             addLog(scan, 'warn', `${m.id} (key ${lane.idx}): ${quotaOutcome.reason}. Model set aside today; remaining models on key ${lane.idx} continue. Chunk ${chunkIndex} re-queued.`)
           } else {
-            job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + CHUNK_COOLDOWN_MS
+            const coolMs = quotaOutcome.waitSec > 0 ? quotaOutcome.waitSec * 1000 : CHUNK_COOLDOWN_MS
+            job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + coolMs
             const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
             if (laneState) {
               const ms = laneState.models.find((item) => item.id === m.id)
