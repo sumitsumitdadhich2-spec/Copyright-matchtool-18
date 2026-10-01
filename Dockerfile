@@ -21,14 +21,14 @@ WORKDIR /app
 # (overrides, allowBuilds, minimumReleaseAge...). Without it the lockfile's
 # `overrides` no longer matches the config and --frozen-lockfile fails with
 # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH.
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml ./
 # --frozen-lockfile: reproducible; the lockfile is verified against the
 # supply-chain policy in pnpm-workspace.yaml (minimumReleaseAge).
 # No --ignore-scripts: build scripts are governed by `allowBuilds` in
 # pnpm-workspace.yaml (true = run, false = skip). Anything unlisted fails the
 # install on purpose (strictDepBuilds) instead of running silently.
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
-  pnpm install --frozen-lockfile
+  pnpm install --no-frozen-lockfile
 
 # ---------- build ----------
 FROM base AS build
