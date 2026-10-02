@@ -347,43 +347,6 @@ class GlobalGeminiCoordinator {
 
         const now = Date.now()
 
-        // Provider-wide breaker check
-        if (this.globalPauseUntil > now) {
-          const waitMs = this.globalPauseUntil - now
-          const waitSec = Math.ceil(waitMs / 1000)
-          onWait?.(
-            `[Global Coordinator] Google-wide ${this.activePauseClass || 'incident'} pause active (${waitSec}s remaining). Waiting for provider recovery...`,
-            waitSec,
-          )
-          setTimeout(() => {
-            if (isStopping && isStopping()) {
-              reject(new Error('Stop requested during provider-wide pause'))
-              return
-            }
-            void tryAcquireOrQueue()
-          }, Math.min(waitMs + 50, 4000))
-          return
-        }
-
-        // Post-pause probe: allow exactly 1 probe request through before ramping up
-        if (this.activePauseClass !== null) {
-          if (!this.isProbeInFlight) {
-            this.isProbeInFlight = true
-            this.probeLaneKey = lane.laneKey
-            console.log(`[Global Coordinator] Google-wide pause elapsed. Letting exactly 1 probe request through on Key ${lane.keyIdx} · ${modelId}...`)
-          } else if (this.probeLaneKey !== lane.laneKey) {
-            onWait?.(`[Global Coordinator] Waiting for single probe request to verify Google recovery before ramping up...`, 2)
-            setTimeout(() => {
-              if (isStopping && isStopping()) {
-                reject(new Error('Stop requested while waiting for probe'))
-                return
-              }
-              void tryAcquireOrQueue()
-            }, 1500)
-            return
-          }
-        }
-
         // Verifier-specific batch rules & 429 priority retry locks (Coordinator level):
         if (isVerify) {
           const vmState = this.getVerifyModelState(apiKey, modelId)
@@ -414,7 +377,7 @@ class GlobalGeminiCoordinator {
             const waitSec = Math.ceil(waitMs / 1000)
             const cdReason = vmState.retryLockId !== null
               ? '429 rate limit cooldown'
-              : 'mandatory 1 min cooldown after 3 successful requests'
+              : 'mandatory 30s cooldown after 3 successful requests'
             onWait?.(
               `[Global Coordinator] Key ${lane.keyIdx} · ${displayModelName(modelId)} in ${cdReason} (${waitSec}s remaining). Prepared clips ready in memory...`,
               waitSec,
@@ -554,7 +517,7 @@ class GlobalGeminiCoordinator {
 
         // Re-read lane's cooldown and global pause state before acquiring exclusively
         const checkNow = Date.now()
-        if (this.globalPauseUntil > checkNow || lane.cooldownUntil > checkNow || lane.nextFreeAt > checkNow) {
+        if (lane.cooldownUntil > checkNow || lane.nextFreeAt > checkNow) {
           void tryAcquireOrQueue()
           return
         }
@@ -781,7 +744,7 @@ class GlobalGeminiCoordinator {
     }
   }
 
-  /** Record a breaker failure and trigger provider-wide pause if threshold met */
+  /** Record breaker failure — keeps key-level diagnostics without freezing healthy keys/models */
   public recordBreakerFailure(
     apiKey: string,
     modelId: string,
@@ -794,36 +757,6 @@ class GlobalGeminiCoordinator {
     const kh = apiKeyHash(apiKey)
     this.breakerEvents.push({ time: now, keyHash: kh, failureClass })
     this.breakerEvents = this.breakerEvents.filter((e) => now - e.time <= 60_000)
-
-    const activeKeys = new Set<string>()
-    for (const lane of this.lanes.values()) {
-      if ((lane.activeSince && now - lane.activeSince <= 60_000) || (lane.lastCompletedAt && now - lane.lastCompletedAt <= 60_000)) {
-        activeKeys.add(lane.keyHash)
-      }
-    }
-    for (const e of this.breakerEvents) {
-      activeKeys.add(e.keyHash)
-    }
-
-    const classKeys = new Set<string>()
-    for (const e of this.breakerEvents) {
-      if (e.failureClass === failureClass) {
-        classKeys.add(e.keyHash)
-      }
-    }
-
-    const activeCount = activeKeys.size
-    if (classKeys.size >= 4 && activeCount > 0 && classKeys.size / activeCount >= 0.5) {
-      if (now >= this.globalPauseUntil) {
-        const pauseMin = this.breakerBackoffMinutes[Math.min(this.breakerBackoffIndex, this.breakerBackoffMinutes.length - 1)]
-        this.breakerBackoffIndex = Math.min(this.breakerBackoffMinutes.length - 1, this.breakerBackoffIndex + 1)
-        this.globalPauseUntil = now + pauseMin * 60_000
-        this.activePauseClass = failureClass
-        this.isProbeInFlight = false
-        this.probeLaneKey = null
-        console.log(`Google-wide ${failureClass} event, pausing ${pauseMin} min`)
-      }
-    }
   }
 
   /** Report a 429 Rate Limit error on a lane across the entire app */
@@ -926,7 +859,7 @@ class GlobalGeminiCoordinator {
     if (vmState.successCount >= 3) {
       vmState.successCount = 0
       const now = Date.now()
-      const cooldownMs = 60_000 // 1 minute
+      const cooldownMs = 30_000 // 30 seconds (reduced from 60s per user instruction)
       const coolUntil = now + cooldownMs
       vmState.cooldownUntil = coolUntil
 
@@ -937,7 +870,7 @@ class GlobalGeminiCoordinator {
       }
 
       console.log(
-        `[Global Coordinator] 3 successful verify requests completed on ${modelId} (Key hash: ${kh.slice(0, 6)}). Enforcing mandatory 1-minute cooldown across all slots.`,
+        `[Global Coordinator] 3 successful verify requests completed on ${modelId} (Key hash: ${kh.slice(0, 6)}). Enforcing mandatory 30-second cooldown across all slots.`,
       )
       return {
         cooldownTriggered: true,
@@ -1089,16 +1022,6 @@ class GlobalGeminiCoordinator {
           : errorOrKind === true
             ? 'rpd'
             : 'rate'
-
-    // If probe failed during pause:
-    if (this.activePauseClass !== null && this.isProbeInFlight && this.probeLaneKey === lane.laneKey) {
-      this.isProbeInFlight = false
-      this.probeLaneKey = null
-      const pauseMin = this.breakerBackoffMinutes[Math.min(this.breakerBackoffIndex, this.breakerBackoffMinutes.length - 1)]
-      this.breakerBackoffIndex = Math.min(this.breakerBackoffMinutes.length - 1, this.breakerBackoffIndex + 1)
-      this.globalPauseUntil = Date.now() + pauseMin * 60_000
-      console.log(`Google-wide ${this.activePauseClass} event, pausing ${pauseMin} min`)
-    }
 
     // 1. FINAL DECISION: Only if actual recorded usage has reached or exceeded the setting quota cap is it exhausted!
     if (used >= rpdCap) {

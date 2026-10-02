@@ -73,8 +73,8 @@ export const MINUTE_FINDER_WINDOW_SEC = 1200
 export const MINUTE_FINDER_MAX_SHORT_SEC = 180
 /** Gemini files live 48 h — reuse uploads for 47 h. */
 const UPLOAD_TTL_MS = 47 * 60 * 60 * 1000
-/** Strict attempt cap of 6 per window: stops infinite retry loops if a window fails repeatedly. */
-const MAX_WINDOW_ATTEMPTS = 6
+/** Strict attempt cap of 20 per window: allows resilient retries for temporary spikes while covering the whole movie. */
+const MAX_WINDOW_ATTEMPTS = 20
 /** How long to wait for movie chunking to finish before the chunk scan can start. */
 const CHUNKING_WAIT_MS = 45 * 60_000
 /** BACKUP pass: every gap is padded on both sides (short-side timestamps are ±2 s approx). */

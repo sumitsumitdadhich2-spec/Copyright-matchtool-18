@@ -1860,7 +1860,7 @@ class Scheduler {
             addLog(
               job.scan,
               'info',
-              `Verifier: 3 successful requests completed on ${displayModelName(m.id)} (key ${lane.idx}) — 1 min cooldown started. Next requests will be prepared and held ready.`,
+              `Verifier: 3 successful requests completed on ${displayModelName(m.id)} (key ${lane.idx}) — 30s cooldown started. Next requests will be prepared and held ready.`,
             )
           } else if (outcome.retryCleared) {
             addLog(
@@ -2244,7 +2244,7 @@ class Scheduler {
               : undefined
 
           let rescanFound: { start: number; end: number } | null = null
-          const MAX_RESCAN_TRIES = Math.min(5, rescanCandidateLanes.length)
+          const MAX_RESCAN_TRIES = Math.min(4, rescanCandidateLanes.length)
 
           for (let tryIdx = 0; tryIdx < MAX_RESCAN_TRIES; tryIdx++) {
             if (job.stopping) return
